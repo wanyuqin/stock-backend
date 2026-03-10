@@ -97,7 +97,6 @@ func (h *TradeHandler) GetPerformance(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────
 
 // defaultUserID 当前为单用户系统，固定 user_id = 1。
-const defaultUserID int64 = 1
 
 // isValidationErr 判断是否为业务层校验错误（应返回 400）。
 // 校验错误由 validateTradeRequest / parseTradedAt 产生，

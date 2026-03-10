@@ -30,20 +30,25 @@ func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
 	stockRepo     := repo.NewStockRepo(db)
 	watchlistRepo := repo.NewWatchlistRepo(db)
 	tradeRepo     := repo.NewTradeLogRepo(db)
+	scanRepo      := repo.NewScanRepo(db)
 
-	stockSvc    := service.NewStockService(log)
-	aiSvc       := service.NewAIAnalysisService(log)
-	tradeSvc    := service.NewTradeService(tradeRepo, stockSvc, log)
+	stockSvc  := service.NewStockService(log)
+	aiSvc     := service.NewAIAnalysisService(log)
+	tradeSvc  := service.NewTradeService(tradeRepo, stockSvc, log)
+	scanSvc   := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
+	reportSvc := service.NewReportService(scanRepo, aiSvc, log)
 
 	stockHandler     := handler.NewStockHandler(stockRepo, stockSvc, log)
 	watchlistHandler := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
 	analysisHandler  := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
 	tradeHandler     := handler.NewTradeHandler(tradeSvc, log)
+	scanHandler      := handler.NewScanHandler(scanSvc, reportSvc, log)
+	reportHandler    := handler.NewReportHandler(reportSvc, log)
 	healthHandler    := handler.NewHealthHandler()
 
 	// ── 健康检查 ──────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
-	r.GET("/readyz", healthHandler.Ready)
+	r.GET("/readyz",  healthHandler.Ready)
 
 	// ── API v1 ───────────────────────────────────────────────────
 	v1 := r.Group("/api/v1")
@@ -51,32 +56,57 @@ func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		// ── 股票 ────────────────────────────────────────────────
 		stocks := v1.Group("/stocks")
 		{
-			stocks.GET("",                stockHandler.List)           // GET  /api/v1/stocks
-			stocks.GET("/:code",          stockHandler.GetByCode)      // GET  /api/v1/stocks/:code
-			stocks.GET("/:code/quote",    stockHandler.GetQuote)       // GET  /api/v1/stocks/:code/quote
-			stocks.GET("/:code/kline",    analysisHandler.GetKLine)    // GET  /api/v1/stocks/:code/kline
-			stocks.GET("/:code/analysis", analysisHandler.GetAnalysis) // GET  /api/v1/stocks/:code/analysis
+			stocks.GET("",                stockHandler.List)
+			stocks.GET("/:code",          stockHandler.GetByCode)
+			stocks.GET("/:code/quote",    stockHandler.GetQuote)
+			stocks.GET("/:code/kline",    analysisHandler.GetKLine)
+			stocks.GET("/:code/analysis", analysisHandler.GetAnalysis)
 		}
 
 		// ── 自选股 ──────────────────────────────────────────────
 		watchlist := v1.Group("/watchlist")
 		{
-			watchlist.GET("",          watchlistHandler.List)   // GET    /api/v1/watchlist
-			watchlist.POST("",         watchlistHandler.Add)    // POST   /api/v1/watchlist
-			watchlist.DELETE("/:code", watchlistHandler.Remove) // DELETE /api/v1/watchlist/:code
+			watchlist.GET("",          watchlistHandler.List)
+			watchlist.POST("",         watchlistHandler.Add)
+			watchlist.DELETE("/:code", watchlistHandler.Remove)
 		}
 
 		// ── 交易日志 ─────────────────────────────────────────────
 		trades := v1.Group("/trades")
 		{
-			trades.POST("",       tradeHandler.AddTrade)   // POST /api/v1/trades
-			trades.GET("/:code",  tradeHandler.ListByCode) // GET  /api/v1/trades/:code
+			trades.POST("",      tradeHandler.AddTrade)
+			trades.GET("/:code", tradeHandler.ListByCode)
 		}
 
 		// ── 统计 ─────────────────────────────────────────────────
 		stats := v1.Group("/stats")
 		{
-			stats.GET("/performance", tradeHandler.GetPerformance) // GET /api/v1/stats/performance
+			stats.GET("/performance", tradeHandler.GetPerformance)
+		}
+
+		// ── 复盘报告 ─────────────────────────────────────────────
+		// GET  /api/v1/reports/daily              — 获取今日报告（DB 缓存优先）
+		// GET  /api/v1/reports/daily?date=YYYY    — 获取指定日期报告
+		// GET  /api/v1/reports/daily?force=1      — 强制重新生成今日报告
+		// POST /api/v1/reports/daily/generate     — 手动触发生成（供 admin 使用）
+		reports := v1.Group("/reports")
+		{
+			reports.GET("/daily",            reportHandler.GetDailyReport)
+			reports.POST("/daily/generate",  reportHandler.GenerateDailyReport)
+		}
+
+		// ── 管理 / 扫描 ──────────────────────────────────────────
+		// POST /api/v1/admin/scan/run     — 扫描 + 自动触发报告生成
+		// GET  /api/v1/admin/scan/today   — 今日扫描结果
+		// GET  /api/v1/admin/scan/history — 历史扫描结果 ?date=YYYY-MM-DD
+		admin := v1.Group("/admin")
+		{
+			scan := admin.Group("/scan")
+			{
+				scan.POST("/run",    scanHandler.RunScan)
+				scan.GET("/today",   scanHandler.ListTodayScans)
+				scan.GET("/history", scanHandler.ListScansByDate)
+			}
 		}
 	}
 
