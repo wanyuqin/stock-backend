@@ -1,0 +1,41 @@
+services:
+  # 数据库：存储股票信息、自选股、交易日志和 AI 缓存
+  db:
+    image: postgres:15-alpine
+    container_name: stock_db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: stock_password_123
+      POSTGRES_DB: stock_system
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # 缓存：存储实时行情、Session 和临时计算结果
+  redis:
+    image: redis:7-alpine
+    container_name: stock_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+
+  # 管理工具：可视化数据库管理界面
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: stock_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+
+networks:
+  default:
+    name: stock-network
