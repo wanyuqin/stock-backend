@@ -84,6 +84,35 @@ CREATE INDEX IF NOT EXISTS idx_scans_date        ON daily_scans  (scan_date);
 CREATE INDEX IF NOT EXISTS idx_scans_code_date   ON daily_scans  (stock_code, scan_date);
 CREATE INDEX IF NOT EXISTS idx_reports_date      ON daily_reports (report_date);
 
+
+
+CREATE TABLE IF NOT EXISTS daily_scans (
+                                           id           BIGSERIAL     PRIMARY KEY,
+                                           scan_date    DATE          NOT NULL DEFAULT CURRENT_DATE,
+                                           stock_code   VARCHAR(10)   NOT NULL,
+    stock_name   VARCHAR(50),
+    signals      JSONB         NOT NULL,
+    price        NUMERIC(12,4),
+    pct_chg      NUMERIC(8,2),
+    volume_ratio NUMERIC(8,2),
+    ma_status    VARCHAR(50),
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+    );
+
+CREATE TABLE IF NOT EXISTS daily_reports (
+                                             id           BIGSERIAL    PRIMARY KEY,
+                                             report_date  DATE         NOT NULL UNIQUE DEFAULT CURRENT_DATE,
+                                             content      TEXT         NOT NULL,
+                                             market_mood  VARCHAR(20),
+    scan_count   INT,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+
+CREATE INDEX IF NOT EXISTS idx_scans_date       ON daily_scans   (scan_date);
+CREATE INDEX IF NOT EXISTS idx_scans_code_date  ON daily_scans   (stock_code, scan_date);
+CREATE INDEX IF NOT EXISTS idx_reports_date     ON daily_reports  (report_date);
+
+
 -- ── 示例数据 ──────────────────────────────────────────────────
 INSERT INTO stocks (code, name, market, sector) VALUES
     ('600519', '贵州茅台', 'SH', '食品饮料'),

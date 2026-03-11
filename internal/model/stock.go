@@ -7,13 +7,16 @@ import "time"
 // ═══════════════════════════════════════════════════════════════
 
 type Stock struct {
-	ID        int64     `gorm:"column:id;primaryKey;autoIncrement"        json:"id"`
-	Code      string    `gorm:"column:code;type:varchar(10);not null"     json:"code"`
-	Name      string    `gorm:"column:name;type:varchar(50);not null"     json:"name"`
-	Market    Market    `gorm:"column:market;type:varchar(4);not null"    json:"market"`
-	Sector    string    `gorm:"column:sector;type:varchar(50)"            json:"sector"`
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"          json:"created_at"`
-	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime"          json:"updated_at"`
+	ID              int64    `gorm:"column:id;primaryKey;autoIncrement"        json:"id"`
+	Code            string   `gorm:"column:code;type:varchar(10);not null"     json:"code"`
+	Name            string   `gorm:"column:name;type:varchar(50);not null"     json:"name"`
+	Market          Market   `gorm:"column:market;type:varchar(4);not null"    json:"market"`
+	Sector          string   `gorm:"column:sector;type:varchar(50)"            json:"sector"`
+	// *float64 指针：区分"尚未抓取(nil)"和"净流出(负数)"
+	// 用 float64 而非 int64：pgx 从 NUMERIC(15,2) 返回字符串，GORM 只能 Scan 到 float64
+	LatestMoneyFlow *float64 `gorm:"column:latest_money_flow"                  json:"latest_money_flow"`
+	CreatedAt       time.Time `gorm:"column:created_at;autoCreateTime"         json:"created_at"`
+	UpdatedAt       time.Time `gorm:"column:updated_at;autoUpdateTime"         json:"updated_at"`
 }
 
 func (Stock) TableName() string { return "stocks" }
@@ -43,8 +46,6 @@ func (Watchlist) TableName() string { return "watchlist" }
 // trade_logs 表
 // ═══════════════════════════════════════════════════════════════
 
-// TradeLog 交易记录。
-// Reason 字段对应 trade_logs.reason（交易理由/备注，可为空）。
 type TradeLog struct {
 	ID        int64       `gorm:"column:id;primaryKey;autoIncrement"          json:"id"`
 	UserID    int64       `gorm:"column:user_id;not null;default:1"           json:"user_id"`
@@ -59,12 +60,8 @@ type TradeLog struct {
 
 func (TradeLog) TableName() string { return "trade_logs" }
 
-// Amount 返回此笔交易的资金量（价格 × 数量）。
-func (t *TradeLog) Amount() float64 {
-	return t.Price * float64(t.Volume)
-}
+func (t *TradeLog) Amount() float64 { return t.Price * float64(t.Volume) }
 
-// TradeAction 枚举：买入 / 卖出
 type TradeAction string
 
 const (

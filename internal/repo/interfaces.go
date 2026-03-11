@@ -12,6 +12,7 @@ type StockRepo interface {
 	GetByCode(ctx context.Context, code string) (*model.Stock, error)
 	List(ctx context.Context, limit, offset int) ([]*model.Stock, error)
 	Upsert(ctx context.Context, s *model.Stock) error
+	UpdateMoneyFlow(ctx context.Context, code string, inflow float64) error
 }
 
 // WatchlistRepo 自选股数据访问接口。
@@ -37,22 +38,46 @@ type AICacheRepo interface {
 
 // ScanRepo 扫描结果 & 日报数据访问接口。
 type ScanRepo interface {
-	// ── daily_scans ───────────────────────────────────────────────
-
-	// BatchInsertScans 批量写入当次扫描命中的记录（同一 scan_date 可多次写入）。
 	BatchInsertScans(ctx context.Context, scans []*model.DailyScan) error
-
-	// ListScansByDate 查询某日所有扫描结果（scan_date 倒序创建时间）。
 	ListScansByDate(ctx context.Context, date time.Time) ([]*model.DailyScan, error)
-
-	// ── daily_reports ─────────────────────────────────────────────
-
-	// UpsertReport 写入或覆盖某日报告（依赖 report_date UNIQUE 约束做 ON CONFLICT UPDATE）。
 	UpsertReport(ctx context.Context, report *model.DailyReport) error
-
-	// GetReportByDate 查询某日报告，不存在返回 nil, nil。
 	GetReportByDate(ctx context.Context, date time.Time) (*model.DailyReport, error)
-
-	// ListReports 按 report_date 倒序列出最近 n 条报告。
 	ListReports(ctx context.Context, limit int) ([]*model.DailyReport, error)
+}
+
+// MoneyFlowRepo 资金流向日志访问接口。
+type MoneyFlowRepo interface {
+	Insert(ctx context.Context, mf *model.MoneyFlowLog) error
+	ListByCode(ctx context.Context, code string, limit int) ([]*model.MoneyFlowLog, error)
+	LatestByCode(ctx context.Context, code string) (*model.MoneyFlowLog, error)
+}
+
+// AlertRepo 告警事件访问接口。
+type AlertRepo interface {
+	Create(ctx context.Context, a *model.Alert) error
+	ListUnread(ctx context.Context, limit int) ([]*model.Alert, error)
+	ListRecent(ctx context.Context, limit int) ([]*model.Alert, error)
+	MarkRead(ctx context.Context, ids []int64) error
+}
+
+// PositionGuardianRepo 持仓明细 & 诊断快照访问接口。
+type PositionGuardianRepo interface {
+	// ListAll 返回所有 quantity>0 的持仓
+	ListAll(ctx context.Context) ([]*model.PositionDetail, error)
+	// GetByCode 按股票代码查单条
+	GetByCode(ctx context.Context, code string) (*model.PositionDetail, error)
+	// Upsert 按 stock_code 唯一键插入或更新
+	Upsert(ctx context.Context, p *model.PositionDetail) error
+	// SaveDiagnostic 写入诊断快照
+	SaveDiagnostic(ctx context.Context, d *model.PositionDiagnostic) error
+}
+
+// SnapshotRepo 全市场每日快照访问接口。
+type SnapshotRepo interface {
+	// BulkUpsert 批量写入/更新快照（ON CONFLICT (trade_date, code) DO UPDATE）。
+	BulkUpsert(ctx context.Context, snapshots []*model.StockDailySnapshot) error
+	// ListByDate 读取某日全量快照，供筛选器内存打分。
+	ListByDate(ctx context.Context, date time.Time) ([]*model.StockDailySnapshot, error)
+	// CountByDate 返回某日快照总数（快速健康检查）。
+	CountByDate(ctx context.Context, date time.Time) (int64, error)
 }

@@ -1,0 +1,2 @@
+// UpdateMoneyFlow 更新 stocks.latest_money_flow（元），参数用 float64 以匹配 NUMERIC(15,2) 的 pgx 返回类型。
+UpdateMoneyFlow(ctx context.Context, code string, inflow float64) error

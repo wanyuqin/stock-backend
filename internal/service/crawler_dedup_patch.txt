@@ -1,0 +1,15 @@
+	// 2. Worker Pool 并发解析
+	tradeDate := todayDate()
+	snapshots, err := s.parseWithWorkerPool(allItems, tradeDate)
+	if err != nil {
+		return 0, fmt.Errorf("parseWithWorkerPool: %w", err)
+	}
+
+	// 3. 去重：按 code 保留最后一条（分页重叠时以最新数据为准）
+	snapshots = deduplicateSnapshots(snapshots)
+	s.log.Info("crawler: after dedup", zap.Int("valid", len(snapshots)))
+
+	// 4. 批量 Upsert
+	if err := s.snapshotRepo.BulkUpsert(ctx, snapshots); err != nil {
+		return 0, fmt.Errorf("BulkUpsert: %w", err)
+	}

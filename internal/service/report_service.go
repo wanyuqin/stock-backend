@@ -35,13 +35,13 @@ func NewReportService(scanRepo repo.ScanRepo, aiSvc *AIAnalysisService, log *zap
 
 // DailyReportDTO GET /api/v1/reports/daily 返回体。
 type DailyReportDTO struct {
-	Date       string           `json:"date"`
-	Content    string           `json:"content"`    // Markdown 全文
-	MarketMood string           `json:"market_mood"` // 贪婪 / 中性 / 恐惧
-	ScanCount  int              `json:"scan_count"`  // 今日命中信号股票数
-	Scans      []*model.DailyScan `json:"scans"`     // 今日扫描明细（供信号看板）
-	FromCache  bool             `json:"from_cache"`
-	GeneratedAt string          `json:"generated_at"`
+	Date        string             `json:"date"`
+	Content     string             `json:"content"`     // Markdown 全文
+	MarketMood  string             `json:"market_mood"` // 贪婪 / 中性 / 恐惧
+	ScanCount   int                `json:"scan_count"`  // 今日命中信号股票数
+	Scans       []*model.DailyScan `json:"scans"`       // 今日扫描明细（供信号看板）
+	FromCache   bool               `json:"from_cache"`
+	GeneratedAt string             `json:"generated_at"`
 }
 
 // ── 核心方法 ──────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ func (s *ReportService) GenerateDailyReport(ctx context.Context) (*DailyReportDT
 		// 有 API Key → 调 AI；否则用规则降级
 		if s.aiSvc.apiKey != "" {
 			prompt := buildReportPrompt(today, scans, mood)
-			content, err = s.aiSvc.callClaude(ctx, prompt)
+			content, err = s.aiSvc.callEino(ctx, prompt)
 			if err != nil {
 				s.log.Warn("AI report generation failed, fallback to template",
 					zap.Error(err))

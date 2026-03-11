@@ -12,14 +12,12 @@ import (
 	"stock-backend/internal/service"
 )
 
-func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
+func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoveryService) {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	r := gin.New()
-
-	// ── 全局中间件 ───────────────────────────────────────────────
 	r.Use(gin.Recovery())
 	r.Use(middleware.ZapLogger(log))
 	r.Use(middleware.CORS(cfg.CORSAllowedOrigins))
@@ -31,39 +29,50 @@ func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
 	watchlistRepo := repo.NewWatchlistRepo(db)
 	tradeRepo     := repo.NewTradeLogRepo(db)
 	scanRepo      := repo.NewScanRepo(db)
+	mfRepo        := repo.NewMoneyFlowRepo(db)
+	alertRepo     := repo.NewAlertRepo(db)
+	snapshotRepo  := repo.NewSnapshotRepo(db)
+	positionRepo  := repo.NewPositionRepo(db)
 
-	stockSvc  := service.NewStockService(log)
-	aiSvc     := service.NewAIAnalysisService(log)
-	tradeSvc  := service.NewTradeService(tradeRepo, stockSvc, log)
-	scanSvc   := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
-	reportSvc := service.NewReportService(scanRepo, aiSvc, log)
+	stockSvc     := service.NewStockService(log)
+	aiSvc        := service.NewAIAnalysisService(log)
+	tradeSvc     := service.NewTradeService(tradeRepo, stockSvc, log)
+	scanSvc      := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
+	reportSvc    := service.NewReportService(scanRepo, aiSvc, log)
+	mfSvc        := service.NewMoneyFlowService(mfRepo, stockRepo, log)
+	discoverySvc := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
+	crawlerSvc   := service.NewCrawlerService(snapshotRepo, log)
+	screenerSvc  := service.NewScreenerService(snapshotRepo, log)
+	guardianSvc  := service.NewPositionGuardianService(positionRepo, stockSvc, aiSvc, log)
 
-	stockHandler     := handler.NewStockHandler(stockRepo, stockSvc, log)
+	stockHandler    := handler.NewStockHandler(stockRepo, stockSvc, log)
 	watchlistHandler := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
-	analysisHandler  := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
-	tradeHandler     := handler.NewTradeHandler(tradeSvc, log)
-	scanHandler      := handler.NewScanHandler(scanSvc, reportSvc, log)
-	reportHandler    := handler.NewReportHandler(reportSvc, log)
-	healthHandler    := handler.NewHealthHandler()
+	analysisHandler := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
+	tradeHandler    := handler.NewTradeHandler(tradeSvc, log)
+	scanHandler     := handler.NewScanHandler(scanSvc, reportSvc, log)
+	reportHandler   := handler.NewReportHandler(reportSvc, log)
+	alertHandler    := handler.NewAlertHandler(discoverySvc, mfSvc, log)
+	screenerHandler := handler.NewScreenerHandler(screenerSvc, crawlerSvc, log)
+	positionHandler := handler.NewPositionHandler(guardianSvc, log)
+	healthHandler   := handler.NewHealthHandler()
 
-	// ── 健康检查 ──────────────────────────────────────────────────
+	// ── 路由 ─────────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
 	r.GET("/readyz",  healthHandler.Ready)
 
-	// ── API v1 ───────────────────────────────────────────────────
 	v1 := r.Group("/api/v1")
 	{
-		// ── 股票 ────────────────────────────────────────────────
 		stocks := v1.Group("/stocks")
 		{
-			stocks.GET("",                stockHandler.List)
-			stocks.GET("/:code",          stockHandler.GetByCode)
-			stocks.GET("/:code/quote",    stockHandler.GetQuote)
-			stocks.GET("/:code/kline",    analysisHandler.GetKLine)
-			stocks.GET("/:code/analysis", analysisHandler.GetAnalysis)
+			stocks.GET("",                   stockHandler.List)
+			stocks.GET("/:code",             stockHandler.GetByCode)
+			stocks.GET("/:code/quote",       stockHandler.GetQuote)
+			stocks.GET("/:code/kline",       analysisHandler.GetKLine)
+			stocks.GET("/:code/analysis",    analysisHandler.GetAnalysis)
+			stocks.GET("/:code/money-flow",          alertHandler.GetMoneyFlow)
+			stocks.POST("/:code/money-flow/refresh", alertHandler.RefreshMoneyFlow)
 		}
 
-		// ── 自选股 ──────────────────────────────────────────────
 		watchlist := v1.Group("/watchlist")
 		{
 			watchlist.GET("",          watchlistHandler.List)
@@ -71,34 +80,44 @@ func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
 			watchlist.DELETE("/:code", watchlistHandler.Remove)
 		}
 
-		// ── 交易日志 ─────────────────────────────────────────────
 		trades := v1.Group("/trades")
 		{
 			trades.POST("",      tradeHandler.AddTrade)
 			trades.GET("/:code", tradeHandler.ListByCode)
 		}
 
-		// ── 统计 ─────────────────────────────────────────────────
-		stats := v1.Group("/stats")
-		{
-			stats.GET("/performance", tradeHandler.GetPerformance)
-		}
+		v1.Group("/stats").GET("/performance", tradeHandler.GetPerformance)
 
-		// ── 复盘报告 ─────────────────────────────────────────────
-		// GET  /api/v1/reports/daily              — 获取今日报告（DB 缓存优先）
-		// GET  /api/v1/reports/daily?date=YYYY    — 获取指定日期报告
-		// GET  /api/v1/reports/daily?force=1      — 强制重新生成今日报告
-		// POST /api/v1/reports/daily/generate     — 手动触发生成（供 admin 使用）
 		reports := v1.Group("/reports")
 		{
-			reports.GET("/daily",            reportHandler.GetDailyReport)
-			reports.POST("/daily/generate",  reportHandler.GenerateDailyReport)
+			reports.GET("/daily",           reportHandler.GetDailyReport)
+			reports.POST("/daily/generate", reportHandler.GenerateDailyReport)
 		}
 
-		// ── 管理 / 扫描 ──────────────────────────────────────────
-		// POST /api/v1/admin/scan/run     — 扫描 + 自动触发报告生成
-		// GET  /api/v1/admin/scan/today   — 今日扫描结果
-		// GET  /api/v1/admin/scan/history — 历史扫描结果 ?date=YYYY-MM-DD
+		alerts := v1.Group("/alerts")
+		{
+			alerts.GET("",       alertHandler.ListAlerts)
+			alerts.POST("/read", alertHandler.MarkRead)
+		}
+
+		screener := v1.Group("/screener")
+		{
+			screener.POST("/execute", screenerHandler.Execute)
+			screener.POST("/sync",    screenerHandler.SyncMarketData)
+			screener.GET("/status",   screenerHandler.Status)
+		}
+
+		// ── 持仓守护 ────────────────────────────────────────────────
+		// GET  /diagnose          纯指标刷新（定时轮询，不调 AI，节省 token）
+		// POST /analyze/:code     手动触发单只 AI 深度分析（按需消耗 token）
+		// POST /sync              录入 / 更新持仓成本
+		positions := v1.Group("/positions")
+		{
+			positions.GET("/diagnose",       positionHandler.Diagnose)
+			positions.POST("/analyze/:code", positionHandler.AnalyzeOne)
+			positions.POST("/sync",          positionHandler.SyncPosition)
+		}
+
 		admin := v1.Group("/admin")
 		{
 			scan := admin.Group("/scan")
@@ -116,5 +135,5 @@ func New(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		}
 	}
 
-	return r
+	return r, discoverySvc
 }

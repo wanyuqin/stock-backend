@@ -52,6 +52,19 @@ func (r *stockRepo) Upsert(ctx context.Context, s *model.Stock) error {
 	return nil
 }
 
+// UpdateMoneyFlow 更新 stocks.latest_money_flow（元）。
+// 参数用 float64：pgx 从 NUMERIC(15,2) Scan 返回字符串，GORM 只能自动转 float64。
+func (r *stockRepo) UpdateMoneyFlow(ctx context.Context, code string, inflow float64) error {
+	err := r.db.WithContext(ctx).
+		Model(&model.Stock{}).
+		Where("code = ?", code).
+		Update("latest_money_flow", inflow).Error
+	if err != nil {
+		return fmt.Errorf("UpdateMoneyFlow: %w", err)
+	}
+	return nil
+}
+
 // ═══════════════════════════════════════════════════════════════
 // WatchlistRepo — GORM 实现
 // ═══════════════════════════════════════════════════════════════
@@ -101,7 +114,6 @@ type tradeLogRepo struct{ db *gorm.DB }
 
 func NewTradeLogRepo(db *gorm.DB) TradeLogRepo { return &tradeLogRepo{db: db} }
 
-// Create 插入一条交易记录，使用 Session 禁止 GORM 推断主键（让 DB 自增）。
 func (r *tradeLogRepo) Create(ctx context.Context, t *model.TradeLog) error {
 	if err := r.db.WithContext(ctx).Create(t).Error; err != nil {
 		return fmt.Errorf("Create trade_log: %w", err)
@@ -109,7 +121,6 @@ func (r *tradeLogRepo) Create(ctx context.Context, t *model.TradeLog) error {
 	return nil
 }
 
-// ListByUser 分页查询某用户所有交易记录，traded_at 倒序。
 func (r *tradeLogRepo) ListByUser(ctx context.Context, userID int64, limit, offset int) ([]*model.TradeLog, error) {
 	var logs []*model.TradeLog
 	err := r.db.WithContext(ctx).
@@ -123,7 +134,6 @@ func (r *tradeLogRepo) ListByUser(ctx context.Context, userID int64, limit, offs
 	return logs, nil
 }
 
-// ListByCode 查询某只股票的全部交易记录，traded_at 倒序（不分页）。
 func (r *tradeLogRepo) ListByCode(ctx context.Context, userID int64, code string) ([]*model.TradeLog, error) {
 	var logs []*model.TradeLog
 	err := r.db.WithContext(ctx).
@@ -136,12 +146,11 @@ func (r *tradeLogRepo) ListByCode(ctx context.Context, userID int64, code string
 	return logs, nil
 }
 
-// ListAllByUser 不分页查询全部交易记录，供盈亏计算使用。
 func (r *tradeLogRepo) ListAllByUser(ctx context.Context, userID int64) ([]*model.TradeLog, error) {
 	var logs []*model.TradeLog
 	err := r.db.WithContext(ctx).
 		Where("user_id = ?", userID).
-		Order("stock_code ASC, traded_at ASC, id ASC"). // 按股票分组后按时间升序，便于 FIFO 计算
+		Order("stock_code ASC, traded_at ASC, id ASC").
 		Find(&logs).Error
 	if err != nil {
 		return nil, fmt.Errorf("ListAllByUser trade_logs: %w", err)
