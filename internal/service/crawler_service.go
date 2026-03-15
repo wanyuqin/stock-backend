@@ -25,8 +25,6 @@ import (
 // ═══════════════════════════════════════════════════════════════
 
 const (
-	// fltt=2：所有数值字段保持原始精度（价格单位=元，百分比=实际值）
-	// fltt=1（默认）会把价格*10、百分比*100，导致数值放大
 	emFullMarketBaseURL = "https://push2.eastmoney.com/api/qt/clist/get" +
 		"?fltt=2&fid=f3&po=1" +
 		"&fields=f2,f3,f5,f6,f8,f10,f12,f14,f62,f184" +
@@ -35,8 +33,39 @@ const (
 	crawlerPageSize    = 100
 	crawlerWorkers     = 10
 	crawlerHTTPTimeout = 30 * time.Second
-	crawlerPageDelay   = 200 * time.Millisecond
+	crawlerPageDelay   = 150 * time.Millisecond
 )
+
+// ═══════════════════════════════════════════════════════════════
+// SyncError — 可分类的同步错误
+// ═══════════════════════════════════════════════════════════════
+
+// SyncErrorKind 错误分类
+type SyncErrorKind string
+
+const (
+	// SyncErrNetwork 网络层错误（连接超时、DNS失败等）
+	SyncErrNetwork SyncErrorKind = "network"
+	// SyncErrEmptyData 接口正常响应但返回 0 条数据（非交易时段）
+	SyncErrEmptyData SyncErrorKind = "empty_data"
+	// SyncErrAPI 接口返回了非 0 的 rc 错误码
+	SyncErrAPI SyncErrorKind = "api_error"
+	// SyncErrParse 数据解析失败
+	SyncErrParse SyncErrorKind = "parse_error"
+)
+
+// SyncError 包含分类信息的同步错误
+type SyncError struct {
+	Kind    SyncErrorKind
+	Message string
+	Raw     error
+}
+
+func (e *SyncError) Error() string { return e.Message }
+
+func newSyncErr(kind SyncErrorKind, msg string, raw error) *SyncError {
+	return &SyncError{Kind: kind, Message: msg, Raw: raw}
+}
 
 // ═══════════════════════════════════════════════════════════════
 // 东方财富原始响应结构
@@ -50,8 +79,6 @@ type emFullMarketResp struct {
 	RC int `json:"rc"`
 }
 
-// parseDiff 将 data.diff 字节安全解析为 []map[string]interface{}。
-// 兼容：JSON数组 / 数字键对象 / null / 空对象
 func parseDiff(raw json.RawMessage) ([]map[string]interface{}, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -119,18 +146,26 @@ func NewCrawlerService(snapshotRepo repo.SnapshotRepo, log *zap.Logger) *Crawler
 }
 
 // SyncFullMarketData 分页拉取全市场行情 → 并发解析 → 去重 → 批量 Upsert。
+// 返回 (*SyncError) 类型错误，调用方可按 Kind 分类处理。
 func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 	start := time.Now()
 	s.log.Info("crawler: SyncFullMarketData started")
 
 	allItems, err := s.fetchAllPages(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("fetchAllPages: %w", err)
+		// fetchAllPages 内部已包装为 SyncError
+		return 0, err
 	}
+
 	if len(allItems) == 0 {
-		s.log.Warn("crawler: API returned 0 items")
-		return 0, nil
+		s.log.Warn("crawler: API returned 0 items, likely non-trading hours")
+		return 0, newSyncErr(
+			SyncErrEmptyData,
+			"东方财富接口返回空数据，可能当前为非交易时段（收盘后/周末/节假日）",
+			nil,
+		)
 	}
+
 	s.log.Info("crawler: total fetched",
 		zap.Int("raw_count", len(allItems)),
 		zap.Duration("fetch_elapsed", time.Since(start)),
@@ -139,7 +174,7 @@ func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 	tradeDate := todayDate()
 	snapshots, err := s.parseWithWorkerPool(allItems, tradeDate)
 	if err != nil {
-		return 0, fmt.Errorf("parseWithWorkerPool: %w", err)
+		return 0, newSyncErr(SyncErrParse, "数据解析失败: "+err.Error(), err)
 	}
 	s.log.Info("crawler: parsed", zap.Int("parsed_count", len(snapshots)))
 
@@ -148,7 +183,6 @@ func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 	if dups := before - len(snapshots); dups > 0 {
 		s.log.Warn("crawler: removed duplicate codes", zap.Int("duplicates", dups))
 	}
-	s.log.Info("crawler: after dedup", zap.Int("final_count", len(snapshots)))
 
 	if err := s.snapshotRepo.BulkUpsert(ctx, snapshots); err != nil {
 		return 0, fmt.Errorf("BulkUpsert: %w", err)
@@ -167,7 +201,7 @@ func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interface{}, error) {
 	firstPage, total, err := s.fetchPage(1)
 	if err != nil {
-		return nil, fmt.Errorf("page 1: %w", err)
+		return nil, newSyncErr(SyncErrNetwork, "抓取第1页失败: "+err.Error(), err)
 	}
 
 	s.log.Info("crawler: first page",
@@ -183,8 +217,6 @@ func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interf
 	}
 
 	totalPages := (total + crawlerPageSize - 1) / crawlerPageSize
-	s.log.Info("crawler: will fetch pages", zap.Int("total_pages", totalPages))
-
 	for page := 2; page <= totalPages; page++ {
 		select {
 		case <-ctx.Done():
@@ -196,20 +228,13 @@ func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interf
 
 		items, _, err := s.fetchPage(page)
 		if err != nil {
-			s.log.Warn("crawler: page failed", zap.Int("page", page), zap.Error(err))
+			s.log.Warn("crawler: page failed, skip", zap.Int("page", page), zap.Error(err))
 			continue
 		}
 		if len(items) == 0 {
-			s.log.Info("crawler: empty page, stopping", zap.Int("page", page))
 			break
 		}
-
 		allItems = append(allItems, items...)
-		s.log.Debug("crawler: page ok",
-			zap.Int("page", page),
-			zap.Int("items", len(items)),
-			zap.Int("accumulated", len(allItems)),
-		)
 	}
 
 	return allItems, nil
@@ -240,25 +265,8 @@ func (s *CrawlerService) fetchPage(page int) ([]map[string]interface{}, int, err
 		return nil, 0, fmt.Errorf("read body page %d: %w", page, err)
 	}
 
-	if page == 1 {
-		preview := body
-		if len(preview) > 400 {
-			preview = preview[:400]
-		}
-		s.log.Debug("crawler: page1 preview", zap.String("body", string(preview)))
-	}
-
 	var parsed emFullMarketResp
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		preview := body
-		if len(preview) > 200 {
-			preview = preview[:200]
-		}
-		s.log.Error("crawler: unmarshal failed",
-			zap.Int("page", page),
-			zap.String("preview", string(preview)),
-			zap.Error(err),
-		)
 		return nil, 0, fmt.Errorf("unmarshal page %d: %w", page, err)
 	}
 	if parsed.RC != 0 {
@@ -338,7 +346,6 @@ func deduplicateSnapshots(snaps []*model.StockDailySnapshot) []*model.StockDaily
 	for i, s := range snaps {
 		seen[s.Code] = i
 	}
-
 	result := make([]*model.StockDailySnapshot, 0, len(seen))
 	added := make(map[string]bool, len(seen))
 	for i := len(snaps) - 1; i >= 0; i-- {
@@ -348,7 +355,6 @@ func deduplicateSnapshots(snaps []*model.StockDailySnapshot) []*model.StockDaily
 			added[code] = true
 		}
 	}
-
 	for l, r := 0, len(result)-1; l < r; l, r = l+1, r-1 {
 		result[l], result[r] = result[r], result[l]
 	}
@@ -362,30 +368,20 @@ func parseSnapshot(raw map[string]interface{}, tradeDate time.Time) (*model.Stoc
 	if code == "" || code == "-" {
 		return nil, nil
 	}
-
 	snap := &model.StockDailySnapshot{
 		TradeDate: tradeDate,
 		Code:      code,
 		Name:      safeStr(raw["f14"]),
 	}
-
-	// fltt=2 时所有字段均为原始精度：
-	// f2  = 价格（元，如 15.23）
-	// f3  = 涨跌幅（%，如 3.25，不是 325）
-	// f8  = 换手率（%，如 2.11）
-	// f10 = 量比（如 1.85）
-	// f62 = 主力净流入（元，大数）
-	// f184= 主力净流入占比（%，如 8.33）
-	snap.Price        = safeFloatPtr(raw["f2"])
-	snap.PctChg       = safeFloatPtr(raw["f3"])
+	snap.Price = safeFloatPtr(raw["f2"])
+	snap.PctChg = safeFloatPtr(raw["f3"])
 	snap.TurnoverRate = safeFloatPtr(raw["f8"])
-	snap.VolRatio     = safeFloatPtr(raw["f10"])
+	snap.VolRatio = safeFloatPtr(raw["f10"])
 
 	mainInflow := safeDecimal(raw["f62"])
 	f := mainInflow.InexactFloat64()
-	snap.MainInflow    = &f
+	snap.MainInflow = &f
 	snap.MainInflowPct = safeFloatPtr(raw["f184"])
-
 	return snap, nil
 }
 

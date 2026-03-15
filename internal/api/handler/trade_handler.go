@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -10,7 +11,6 @@ import (
 	"stock-backend/internal/service"
 )
 
-// TradeHandler 处理交易日志相关路由。
 type TradeHandler struct {
 	tradeSvc *service.TradeService
 	log      *zap.Logger
@@ -22,7 +22,6 @@ func NewTradeHandler(tradeSvc *service.TradeService, log *zap.Logger) *TradeHand
 
 // ─────────────────────────────────────────────────────────────────
 // POST /api/v1/trades
-// Body: { stock_code, action, price, volume, traded_at?, reason? }
 // ─────────────────────────────────────────────────────────────────
 
 func (h *TradeHandler) AddTrade(c *gin.Context) {
@@ -31,10 +30,8 @@ func (h *TradeHandler) AddTrade(c *gin.Context) {
 		BadRequest(c, "请求体格式错误: "+err.Error())
 		return
 	}
-
 	dto, err := h.tradeSvc.AddTradeLog(c.Request.Context(), defaultUserID, &req)
 	if err != nil {
-		// 区分业务校验错误（400）与系统错误（500）
 		if isValidationErr(err) {
 			BadRequest(c, err.Error())
 		} else {
@@ -43,17 +40,34 @@ func (h *TradeHandler) AddTrade(c *gin.Context) {
 		}
 		return
 	}
+	c.JSON(http.StatusCreated, Response{Code: 0, Message: "ok", Data: dto})
+}
 
-	c.JSON(http.StatusCreated, Response{
-		Code:    0,
-		Message: "ok",
-		Data:    dto,
+// ─────────────────────────────────────────────────────────────────
+// GET /api/v1/trades  全量流水（traded_at 倒序）
+// Query: limit=200&offset=0
+// ─────────────────────────────────────────────────────────────────
+
+func (h *TradeHandler) ListAll(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+
+	dtos, err := h.tradeSvc.ListAll(c.Request.Context(), defaultUserID, limit, offset)
+	if err != nil {
+		h.log.Error("ListAll trades failed", zap.Error(err))
+		InternalError(c, err.Error())
+		return
+	}
+	OK(c, gin.H{
+		"items":  dtos,
+		"count":  len(dtos),
+		"limit":  limit,
+		"offset": offset,
 	})
 }
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/trades/:code
-// 返回某只股票的全部交易历史（traded_at 倒序）
 // ─────────────────────────────────────────────────────────────────
 
 func (h *TradeHandler) ListByCode(c *gin.Context) {
@@ -62,24 +76,17 @@ func (h *TradeHandler) ListByCode(c *gin.Context) {
 		BadRequest(c, "code 不能为空")
 		return
 	}
-
 	dtos, err := h.tradeSvc.ListByCode(c.Request.Context(), defaultUserID, code)
 	if err != nil {
 		h.log.Error("ListByCode failed", zap.String("code", code), zap.Error(err))
 		InternalError(c, err.Error())
 		return
 	}
-
-	OK(c, gin.H{
-		"items": dtos,
-		"count": len(dtos),
-		"code":  code,
-	})
+	OK(c, gin.H{"items": dtos, "count": len(dtos), "code": code})
 }
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/stats/performance
-// 计算总盈亏：已平仓实现盈亏 + 持仓浮动盈亏
 // ─────────────────────────────────────────────────────────────────
 
 func (h *TradeHandler) GetPerformance(c *gin.Context) {
@@ -96,21 +103,12 @@ func (h *TradeHandler) GetPerformance(c *gin.Context) {
 // 辅助
 // ─────────────────────────────────────────────────────────────────
 
-// defaultUserID 当前为单用户系统，固定 user_id = 1。
-
-// isValidationErr 判断是否为业务层校验错误（应返回 400）。
-// 校验错误由 validateTradeRequest / parseTradedAt 产生，
-// 包含特定关键词，区别于数据库 IO 错误。
 func isValidationErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	validationKeywords := []string{
-		"不能为空", "格式错误", "必须大于", "超出合理范围",
-		"只能是", "无法解析日期",
-	}
-	for _, kw := range validationKeywords {
+	for _, kw := range []string{"不能为空", "格式错误", "必须大于", "超出合理范围", "只能是", "无法解析日期"} {
 		if strings.Contains(msg, kw) {
 			return true
 		}

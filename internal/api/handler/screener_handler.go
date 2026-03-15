@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -30,21 +31,11 @@ func NewScreenerHandler(
 
 // ─────────────────────────────────────────────────────────────────
 // POST /api/v1/screener/execute
-//
-// 执行多因子筛选，返回打分 TopN 列表。
-//
-// Body:
-//   {
-//     "min_score": 40,   // 最低分（默认 0）
-//     "limit":     50,   // 返回条数（默认 50，上限 500）
-//     "date":      "2025-03-11"  // 可选，空 = 今日
-//   }
 // ─────────────────────────────────────────────────────────────────
 
 func (h *ScreenerHandler) Execute(c *gin.Context) {
 	var req service.ScreenerRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// 允许空 body（使用全部默认值）
 		req = service.ScreenerRequest{}
 	}
 
@@ -61,8 +52,10 @@ func (h *ScreenerHandler) Execute(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/v1/screener/sync
 //
-// 手动触发全市场数据同步（抓取东方财富 → 写入 stock_daily_snapshots）。
-// 正常情况由定时任务驱动，此接口供调试和补抓使用。
+// 返回码说明：
+//   200 synced>0   — 同步成功
+//   200 synced=0   — 非交易时段，接口空数据（不是错误）
+//   500            — 网络超时 / 解析失败 / DB 写入失败（真实错误）
 // ─────────────────────────────────────────────────────────────────
 
 func (h *ScreenerHandler) SyncMarketData(c *gin.Context) {
@@ -70,32 +63,65 @@ func (h *ScreenerHandler) SyncMarketData(c *gin.Context) {
 
 	count, err := h.crawlerSvc.SyncFullMarketData(c.Request.Context())
 	if err != nil {
+		// 判断错误类型
+		var syncErr *service.SyncError
+		if errors.As(err, &syncErr) {
+			switch syncErr.Kind {
+			case service.SyncErrEmptyData:
+				// 非交易时段 — 正常情况，200 返回，前端据此展示提示
+				h.log.Warn("sync: non-trading hours, empty data")
+				c.JSON(http.StatusOK, gin.H{
+					"code":    0,
+					"message": "ok",
+					"data": gin.H{
+						"synced":       0,
+						"non_trading":  true,
+						"notice":       "当前为非交易时段（收盘后/周末/节假日），行情数据暂不可用，请在交易日 09:25–15:00 期间同步",
+					},
+				})
+				return
+
+			case service.SyncErrNetwork:
+				// 网络问题，可重试
+				h.log.Error("sync: network error", zap.Error(err))
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"code":    50001,
+					"message": "网络请求失败，请检查网络后重试: " + syncErr.Message,
+					"data":    nil,
+				})
+				return
+			}
+		}
+
+		// 其他未知错误
 		h.log.Error("SyncFullMarketData failed", zap.Error(err))
-		// 区分网络超时与内部错误
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"code":    50300,
-			"message": "市场数据同步失败，可能是东方财富接口超时: " + err.Error(),
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"code":    50000,
+			"message": "同步失败: " + err.Error(),
 			"data":    nil,
 		})
 		return
 	}
 
-	OK(c, gin.H{
-		"synced": count,
-		"message": "同步完成",
+	h.log.Info("sync: completed", zap.Int("synced", count))
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": "ok",
+		"data": gin.H{
+			"synced":      count,
+			"non_trading": false,
+			"notice":      "",
+		},
 	})
 }
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/screener/status
-//
-// 查询今日快照数量，用于判断是否已完成同步。
 // ─────────────────────────────────────────────────────────────────
 
 func (h *ScreenerHandler) Status(c *gin.Context) {
-	// 复用 Execute 传 0 分限制来获取 total 数量
 	result, err := h.screenerSvc.Execute(c.Request.Context(), service.ScreenerRequest{
-		MinScore: -9999, // 极低分，让全部股票通过过滤
+		MinScore: -9999,
 		Limit:    1,
 	})
 	if err != nil {

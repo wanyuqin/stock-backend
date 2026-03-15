@@ -60,14 +60,20 @@ type emKLineRaw struct {
 
 // GetKLine 是 StockService 上的方法，获取日 K 线数据（最多 limit 根，前复权）。
 func (s *StockService) GetKLine(code string, limit int) (*KLineResponse, error) {
+	return s.GetKLineEndAt(code, time.Now(), limit)
+}
+
+// GetKLineEndAt 获取指定日期截止的日 K 线数据（前复权）。
+func (s *StockService) GetKLineEndAt(code string, end time.Time, limit int) (*KLineResponse, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 120
 	}
 
 	secid := buildSecID(code)
+	endDateStr := end.Format("20060102")
 	rawURL := fmt.Sprintf(
-		"%s?ut=%s&secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&beg=0&end=20500101&lmt=%d",
-		emKLineURL, emKLineUt, secid, limit,
+		"%s?ut=%s&secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&beg=0&end=%s&lmt=%d",
+		emKLineURL, emKLineUt, secid, endDateStr, limit,
 	)
 
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)

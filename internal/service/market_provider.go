@@ -249,10 +249,17 @@ func parseEMResponse(body []byte, code string) (*Quote, error) {
 
 	d := raw.Data
 
-	// 东方财富在非交易时段或代码不存在时，f43 等字段返回 "-"（字符串）
+	closePrice := parseEMFloatOrZero(d.F60)
+
 	price, err := parseEMFloat(d.F43)
 	if err != nil {
-		return nil, fmt.Errorf("invalid price field (f43): %w, body=%s", err, truncate(body, 200))
+		price = 0
+	}
+	if price == 0 && closePrice > 0 {
+		price = closePrice
+	}
+	if price == 0 {
+		return nil, fmt.Errorf("no usable price in response, body=%s", truncate(body, 200))
 	}
 
 	market := "SZ"
@@ -271,17 +278,12 @@ func parseEMResponse(body []byte, code string) (*Quote, error) {
 		Volume:      parseEMInt(d.F47),
 		Amount:      parseEMFloatOrZero(d.F48),
 		VolumeRatio: parseEMFloatOrZero(d.F50),
-		Close:       parseEMFloatOrZero(d.F60),
+		Close:       closePrice,
 		Turnover:    parseEMFloatOrZero(d.F168),
 		Change:      parseEMFloatOrZero(d.F169),
 		ChangeRate:  parseEMFloatOrZero(d.F170),
 		UpdatedAt:   time.Now(),
 		FromCache:   false,
-	}
-
-	// 兜底：非交易时段 price=0，用昨收价填充
-	if quote.Price == 0 && quote.Close > 0 {
-		quote.Price = quote.Close
 	}
 
 	return quote, nil

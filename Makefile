@@ -14,7 +14,7 @@ tidy:
 
 ## lint: 静态检查（需安装 golangci-lint）
 lint:
-	golangci-lint run ./...
+	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.60.1 run ./...
 
 ## test: 运行所有测试
 test:
