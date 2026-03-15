@@ -44,3 +44,6 @@ make run
 ## 环境变量
 
 参考 `.env.example` 复制为 `.env` 后修改。
+
+
+docker exec -i stock_db psql -U admin -d stock_system < docker

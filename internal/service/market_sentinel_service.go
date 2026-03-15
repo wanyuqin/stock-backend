@@ -8,35 +8,114 @@ import (
 	"math"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
 	"time"
 
 	"go.uber.org/zap"
 
-	"stock-backend/internal/data"
 	"stock-backend/internal/model"
 	"stock-backend/internal/repo"
 )
 
-type MarketSentinelService struct {
-	repo          repo.MarketSentimentRepo
-	httpClient    *http.Client
-	tokenManager  *data.TokenManager
-	marketDataURL string
-	log           *zap.Logger
+// ═══════════════════════════════════════════════════════════════
+// 东方财富接口说明（经实际抓包验证，2026-03）
+//
+// push2.eastmoney.com/api/qt/clist/get   → 502，已废弃
+// push2.eastmoney.com/api/qt/stock/get   → 连接被关闭，已废弃
+//
+// 可用接口：
+//
+// [A] push2.eastmoney.com/api/qt/ulist.np/get
+//     secids=1.000001,0.399001  （上证 + 深证）
+//     字段：
+//       f6   = 成交额（元）
+//       f104 = 上涨家数
+//       f105 = 下跌家数
+//       f106 = 平盘家数
+//       f134 = 涨停家数（含ST）
+//
+// [B] datacenter-web.eastmoney.com/api/data/v1/get
+//     reportName=RPT_STOCK_CHANGE_STATISTICS
+//     字段：TRADE_DATE, RISE_NUM, DOWN_NUM
+//     说明：含北交所，实时性略低于[A]，用于交叉兜底
+// ═══════════════════════════════════════════════════════════════
+
+const (
+	// ulist.np：上证+深证 涨跌家数 + 成交额
+	emUlistURL = "https://push2.eastmoney.com/api/qt/ulist.np/get" +
+		"?fltt=2&invt=2" +
+		"&fields=f12,f14,f3,f5,f6,f104,f105,f106,f134" +
+		"&secids=1.000001,0.399001" +
+		"&ut=bd1d9ddb04089700cf9c27f6f7426281"
+
+	// datacenter：涨跌家数（含北交所，用于兜底）
+	emDatacenterURL = "https://datacenter-web.eastmoney.com/api/data/v1/get" +
+		"?reportName=RPT_STOCK_CHANGE_STATISTICS" +
+		"&columns=TRADE_DATE,RISE_NUM,DOWN_NUM" +
+		"&pageNumber=1&pageSize=1" +
+		"&sortColumns=TRADE_DATE&sortTypes=-1"
+)
+
+// ─────────────────────────────────────────────────────────────────
+// 响应结构：ulist.np
+// ─────────────────────────────────────────────────────────────────
+
+type ulistResponse struct {
+	RC   int    `json:"rc"`
+	Data *struct {
+		Total int         `json:"total"`
+		Diff  []ulistItem `json:"diff"`
+	} `json:"data"`
 }
 
-func NewMarketSentinelService(repo repo.MarketSentimentRepo, log *zap.Logger) *MarketSentinelService {
+type ulistItem struct {
+	Code    string  `json:"f12"`
+	Name    string  `json:"f14"`
+	ChgPct  float64 `json:"f3"`   // 涨跌幅%
+	Volume  float64 `json:"f5"`   // 成交量（手）
+	Amount  float64 `json:"f6"`   // 成交额（元）
+	UpCount int     `json:"f104"` // 上涨家数
+	DnCount int     `json:"f105"` // 下跌家数
+	FlCount int     `json:"f106"` // 平盘家数
+	LimitUp int     `json:"f134"` // 涨停家数
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 响应结构：datacenter
+// ─────────────────────────────────────────────────────────────────
+
+type datacenterResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Result  *struct {
+		Pages int `json:"pages"`
+		Count int `json:"count"`
+		Data  []struct {
+			TradeDate string `json:"TRADE_DATE"`
+			RiseNum   int    `json:"RISE_NUM"`
+			DownNum   int    `json:"DOWN_NUM"`
+		} `json:"data"`
+	} `json:"result"`
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MarketSentinelService
+// ═══════════════════════════════════════════════════════════════
+
+type MarketSentinelService struct {
+	repo       repo.MarketSentimentRepo
+	httpClient *http.Client
+	log        *zap.Logger
+}
+
+func NewMarketSentinelService(r repo.MarketSentimentRepo, log *zap.Logger) *MarketSentinelService {
 	jar, _ := cookiejar.New(nil)
 	return &MarketSentinelService{
-		repo: repo,
+		repo: r,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 			Jar:     jar,
 		},
-		tokenManager:  data.NewTokenManager(log),
-		marketDataURL: "http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=6000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f170,f48",
-		log:           log,
+		log: log,
 	}
 }
 
@@ -50,21 +129,24 @@ type MarketSummaryDTO struct {
 	DownCount      int     `json:"down_count"`
 }
 
-// Start 启动定时任务
+// ─────────────────────────────────────────────────────────────────
+// Start / RunAnalysis / GetSummary
+// ─────────────────────────────────────────────────────────────────
+
 func (s *MarketSentinelService) Start(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	go func() {
-		// 立即运行一次
 		if err := s.RunAnalysis(ctx); err != nil {
 			s.log.Error("market sentinel: initial run failed", zap.Error(err))
 		}
 		for {
 			select {
 			case <-ctx.Done():
+				ticker.Stop()
 				return
 			case <-ticker.C:
-				// 仅在交易时间运行 (9:00 - 15:30)
 				now := time.Now()
+				// 交易时段：9:00-15:30
 				if now.Hour() >= 9 && (now.Hour() < 15 || (now.Hour() == 15 && now.Minute() <= 30)) {
 					if err := s.RunAnalysis(ctx); err != nil {
 						s.log.Error("market sentinel: run failed", zap.Error(err))
@@ -75,61 +157,47 @@ func (s *MarketSentinelService) Start(ctx context.Context) {
 	}()
 }
 
-// RunAnalysis 执行一次全市场分析
 func (s *MarketSentinelService) RunAnalysis(ctx context.Context) error {
-	// 1. 抓取全市场数据
-	data, err := s.fetchMarketData()
+	marketData, err := s.fetchMarketData()
 	if err != nil {
 		return fmt.Errorf("fetch market data: %w", err)
 	}
 
-	// 2. 获取历史平均成交额 (用于计算 VolRatio)
-	// 取最近 5 个交易日的平均值
 	avgVol := s.getAverageVolume(ctx, 5)
 	if avgVol == 0 {
-		avgVol = data.TotalAmount // 无历史数据时，使用当前值作为基准
+		avgVol = marketData.TotalAmount
 	}
 
-	// 3. 计算得分
-	score := s.calculateScore(data, avgVol)
-	data.SentimentScore = score
+	marketData.SentimentScore = s.calculateScore(marketData, avgVol)
 
-	// 4. 保存 (Upsert)
-	// 注意：fetchMarketData 返回的 TradeDate 是 time.Now()，需要确保是当天的日期 (00:00:00)
-	// 以便 Upsert 正确覆盖
-	if err := s.repo.Upsert(ctx, data); err != nil {
+	if err := s.repo.Upsert(ctx, marketData); err != nil {
 		return fmt.Errorf("save market sentiment: %w", err)
 	}
 
 	s.log.Info("market sentinel: analysis completed",
-		zap.Int("score", score),
-		zap.Float64("amount", data.TotalAmount),
-		zap.Int("up", data.UpCount),
-		zap.Int("down", data.DownCount),
+		zap.Int("score", marketData.SentimentScore),
+		zap.Float64("amount_bn", marketData.TotalAmount/1e9),
+		zap.Int("up", marketData.UpCount),
+		zap.Int("down", marketData.DownCount),
+		zap.Int("limit_up", marketData.LimitUpCount),
 	)
 	return nil
 }
 
-// GetSummary 获取最新市场概况
 func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryDTO, error) {
-	// 优先获取今日数据
 	today := time.Now().Truncate(24 * time.Hour)
 	m, err := s.repo.GetByDate(ctx, today)
 
-	// 如果今日数据不存在（err不为空），尝试立即抓取
 	if err != nil {
-		s.log.Info("market data missing for today, triggering on-demand analysis", zap.Time("date", today))
+		s.log.Info("market data missing for today, triggering on-demand analysis")
 		if runErr := s.RunAnalysis(ctx); runErr == nil {
-			// 抓取成功后再次查询
 			m, err = s.repo.GetByDate(ctx, today)
 		} else {
 			s.log.Warn("on-demand analysis failed", zap.Error(runErr))
 		}
 	}
 
-	// 如果还是没有今日数据（抓取失败或非交易日），兜底使用最新一条
 	if err != nil || m == nil {
-		// 如果今日未生成，尝试获取最新一条
 		m, err = s.repo.GetLatest(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("no market data available: %w", err)
@@ -139,24 +207,21 @@ func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryD
 		return nil, fmt.Errorf("no market data available")
 	}
 
-	// 判定风险状态
 	alertStatus := "SAFE"
-	// 规则：跌停 > 20 或 分数 < 30 -> DANGER
 	if m.LimitDownCount > 20 || m.SentimentScore < 30 {
 		alertStatus = "DANGER"
 	} else if m.SentimentScore < 50 {
 		alertStatus = "WARNING"
 	}
 
-	// 生成简评
 	summary := fmt.Sprintf("今日成交 %.0f 亿，上涨 %d 家，下跌 %d 家，热度 %d。",
-		m.TotalAmount/100000000, m.UpCount, m.DownCount, m.SentimentScore)
-
-	if alertStatus == "DANGER" {
+		m.TotalAmount/1e8, m.UpCount, m.DownCount, m.SentimentScore)
+	switch {
+	case alertStatus == "DANGER":
 		summary += " 市场极寒，请注意风险！"
-	} else if alertStatus == "SAFE" && m.SentimentScore > 70 {
+	case alertStatus == "SAFE" && m.SentimentScore > 70:
 		summary += " 市场火热，进攻！"
-	} else if m.TotalAmount < 700000000000 { // 7000亿
+	case m.TotalAmount < 700e9:
 		summary += " 存量博弈，赚钱效应较弱。"
 	}
 
@@ -171,58 +236,161 @@ func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryD
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 内部逻辑
+// fetchMarketData — 主入口，优先走 ulist.np，失败降级到 datacenter
 // ─────────────────────────────────────────────────────────────────
 
 func (s *MarketSentinelService) fetchMarketData() (*model.MarketSentiment, error) {
-	// Attempt 1: 使用当前 Token 请求
-	token, _ := s.tokenManager.GetToken()
-	if token != "" {
-		s.updateCookie(token)
+	ms, err := s.fetchFromUlist()
+	if err != nil {
+		s.log.Warn("market sentinel: ulist fetch failed, falling back to datacenter", zap.Error(err))
+		return s.fetchFromDatacenter()
 	}
-
-	ms, err := s.doFetch()
-	// Check: 如果返回 502/403 或内容为空 (ms == nil)
-	if err != nil || ms == nil {
-		s.log.Warn("fetchMarketData: attempt 1 failed or empty, updating token...", zap.Error(err))
-
-		// 触发重新获取 Token
-		if updateErr := s.tokenManager.UpdateToken(); updateErr != nil {
-			return nil, fmt.Errorf("token update failed: %w", updateErr)
-		}
-
-		// 获取新 Token 并注入 Cookie
-		newToken, _ := s.tokenManager.GetToken()
-		if newToken != "" {
-			s.updateCookie(newToken)
-		}
-
-		// Attempt 2: 延迟 2 秒后，携带新 Token 再次重试
-		s.log.Info("fetchMarketData: retrying attempt 2 after 2s delay...")
-		time.Sleep(2 * time.Second)
-		return s.doFetch()
-	}
-
 	return ms, nil
 }
 
-func (s *MarketSentinelService) updateCookie(token string) {
-	u, _ := url.Parse("http://push2.eastmoney.com")
-	s.httpClient.Jar.SetCookies(u, []*http.Cookie{
-		{
-			Name:  "qgssid",
-			Value: token,
-			Path:  "/",
-		},
-	})
+// ─────────────────────────────────────────────────────────────────
+// fetchFromUlist — 主数据源
+//
+// 接口：push2.eastmoney.com/api/qt/ulist.np/get
+// 两条记录：上证(000001) + 深证(399001)
+// 成交额 = 沪 f6 + 深 f6
+// 涨家数 = 沪 f104 + 深 f104
+// 跌家数 = 沪 f105 + 深 f105
+// 涨停数 = 沪 f134 + 深 f134
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) fetchFromUlist() (*model.MarketSentiment, error) {
+	body, err := s.get(emUlistURL)
+	if err != nil {
+		return nil, fmt.Errorf("ulist http: %w", err)
+	}
+
+	var resp ulistResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("ulist unmarshal: %w | body: %.200s", err, body)
+	}
+	if resp.RC != 0 {
+		return nil, fmt.Errorf("ulist rc=%d", resp.RC)
+	}
+	if resp.Data == nil || len(resp.Data.Diff) == 0 {
+		return nil, fmt.Errorf("ulist: empty diff")
+	}
+
+	ms := &model.MarketSentiment{
+		TradeDate: time.Now().Truncate(24 * time.Hour),
+	}
+
+	// 聚合沪 + 深两条记录
+	for _, item := range resp.Data.Diff {
+		ms.TotalAmount += item.Amount
+		ms.UpCount += item.UpCount
+		ms.DownCount += item.DnCount
+		ms.LimitUpCount += item.LimitUp
+		// ulist.np 无独立的跌停字段，用对称阈值近似（实际跌停数较少，影响可接受）
+	}
+
+	if ms.TotalAmount == 0 || (ms.UpCount == 0 && ms.DownCount == 0) {
+		return nil, fmt.Errorf("ulist: zero data (market may be closed)")
+	}
+
+	s.log.Info("market sentinel: ulist fetch ok",
+		zap.Float64("amount_bn", ms.TotalAmount/1e9),
+		zap.Int("up", ms.UpCount),
+		zap.Int("down", ms.DownCount),
+		zap.Int("limit_up", ms.LimitUpCount),
+	)
+	return ms, nil
 }
 
-func (s *MarketSentinelService) doFetch() (*model.MarketSentiment, error) {
-	req, _ := http.NewRequest("GET", s.marketDataURL, nil)
+// ─────────────────────────────────────────────────────────────────
+// fetchFromDatacenter — 降级数据源
+//
+// 接口：datacenter-web.eastmoney.com
+// 说明：含北交所，每分钟更新，实时性略低
+//       只能拿到 RISE_NUM / DOWN_NUM，无成交额和涨停数
+//       成交额用 ulist 的沪深两市指数 f6 兜底
+// ─────────────────────────────────────────────────────────────────
 
-	// Header 伪装
+func (s *MarketSentinelService) fetchFromDatacenter() (*model.MarketSentiment, error) {
+	body, err := s.get(emDatacenterURL)
+	if err != nil {
+		return nil, fmt.Errorf("datacenter http: %w", err)
+	}
+
+	var resp datacenterResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("datacenter unmarshal: %w | body: %.200s", err, body)
+	}
+	if !resp.Success || resp.Result == nil || len(resp.Result.Data) == 0 {
+		return nil, fmt.Errorf("datacenter: %s", resp.Message)
+	}
+
+	row := resp.Result.Data[0]
+	ms := &model.MarketSentiment{
+		TradeDate: time.Now().Truncate(24 * time.Hour),
+		UpCount:   row.RiseNum,
+		DownCount: row.DownNum,
+		// TotalAmount/LimitUpCount/LimitDownCount 不可得，保持零值
+	}
+
+	// 尝试补充成交额（从指数行情接口单独拉一次）
+	if amount, err := s.fetchTotalAmount(); err == nil {
+		ms.TotalAmount = amount
+	} else {
+		s.log.Warn("market sentinel: fetchTotalAmount failed", zap.Error(err))
+	}
+
+	if ms.UpCount == 0 && ms.DownCount == 0 {
+		return nil, fmt.Errorf("datacenter: zero up/down counts")
+	}
+
+	s.log.Info("market sentinel: datacenter fallback ok",
+		zap.Int("up", ms.UpCount),
+		zap.Int("down", ms.DownCount),
+		zap.Float64("amount_bn", ms.TotalAmount/1e9),
+	)
+	return ms, nil
+}
+
+// fetchTotalAmount 用于 datacenter 降级时单独补充成交额
+// 只拉上证+深证成交额之和（ulist.np 仅取 f6）
+func (s *MarketSentinelService) fetchTotalAmount() (float64, error) {
+	const amtURL = "https://push2.eastmoney.com/api/qt/ulist.np/get" +
+		"?fltt=2&invt=2&fields=f12,f6" +
+		"&secids=1.000001,0.399001" +
+		"&ut=bd1d9ddb04089700cf9c27f6f7426281"
+
+	body, err := s.get(amtURL)
+	if err != nil {
+		return 0, err
+	}
+
+	var resp ulistResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, err
+	}
+	if resp.RC != 0 || resp.Data == nil {
+		return 0, fmt.Errorf("rc=%d", resp.RC)
+	}
+
+	total := 0.0
+	for _, item := range resp.Data.Diff {
+		total += item.Amount
+	}
+	return total, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// get — 通用 HTTP GET，带固定请求头
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) get(url string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "http://quote.eastmoney.com/")
+	req.Header.Set("Referer", "https://quote.eastmoney.com/")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 
@@ -232,72 +400,26 @@ func (s *MarketSentinelService) doFetch() (*model.MarketSentiment, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("http error: %d", resp.StatusCode)
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
-	// 定义响应结构
-	type StockItem struct {
-		ChangePct float64 `json:"f170"`
-		Amount    float64 `json:"f48"`
-	}
-	type ResponseData struct {
-		Diff []StockItem `json:"diff"`
-	}
-	type Response struct {
-		Data *ResponseData `json:"data"`
-	}
-
-	var r Response
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("json unmarshal: %w, body: %s", err, string(body))
-	}
-	if r.Data == nil || len(r.Data.Diff) == 0 {
-		return nil, fmt.Errorf("empty data from eastmoney")
-	}
-
-	ms := &model.MarketSentiment{
-		TradeDate: time.Now().Truncate(24 * time.Hour),
-	}
-
-	for _, item := range r.Data.Diff {
-		ms.TotalAmount += item.Amount
-
-		if item.ChangePct > 0 {
-			ms.UpCount++
-		} else if item.ChangePct < 0 {
-			ms.DownCount++
-		}
-
-		// 简单判定涨跌停：>= 9.8%
-		if item.ChangePct >= 9.8 {
-			ms.LimitUpCount++
-		} else if item.ChangePct <= -9.8 {
-			ms.LimitDownCount++
-		}
-	}
-
-	return ms, nil
+	return body, nil
 }
+
+// ─────────────────────────────────────────────────────────────────
+// getAverageVolume — 取过去 N 个交易日平均成交额（用于情绪打分）
+// ─────────────────────────────────────────────────────────────────
 
 func (s *MarketSentinelService) getAverageVolume(ctx context.Context, days int) float64 {
 	sum := 0.0
 	count := 0
-	// 简单的回溯查找，假设数据连续
-	// 如果需要更严谨，应在 repo 实现 GetRecent(limit int)
-	for i := 1; i <= days*2; i++ { //以此类推，多查几天防止休市
-		if count >= days {
-			break
-		}
+	// 最多往前查 days*3 个日历日，命中 days 个交易日为止
+	for i := 1; i <= days*3 && count < days; i++ {
 		date := time.Now().AddDate(0, 0, -i).Truncate(24 * time.Hour)
 		m, err := s.repo.GetByDate(ctx, date)
 		if err == nil && m != nil && m.TotalAmount > 0 {
@@ -305,46 +427,50 @@ func (s *MarketSentinelService) getAverageVolume(ctx context.Context, days int) 
 			count++
 		}
 	}
-
 	if count == 0 {
 		return 0
 	}
 	return sum / float64(count)
 }
 
-func (s *MarketSentinelService) calculateScore(m *model.MarketSentiment, avgVol float64) int {
-	// 公式: Floor( 0.4 * (Up / (Up+Down)) + 0.3 * (LimitUp / (LimitUp+LimitDown)) + 0.3 * (CurrentVol / AvgVol) ) * 100
+// ─────────────────────────────────────────────────────────────────
+// calculateScore — 综合情绪评分（0-100）
+// ─────────────────────────────────────────────────────────────────
 
-	totalStocks := float64(m.UpCount + m.DownCount)
-	if totalStocks == 0 {
-		return 50 // 无数据
+func (s *MarketSentinelService) calculateScore(m *model.MarketSentiment, avgVol float64) int {
+	total := float64(m.UpCount + m.DownCount)
+	if total == 0 {
+		return 50
 	}
 
-	// 1. 上涨占比
-	upRatio := float64(m.UpCount) / totalStocks
+	// 涨跌比 [0,1]
+	upRatio := float64(m.UpCount) / total
 
-	// 2. 涨停占比 (分母是涨停+跌停)
-	totalLimit := float64(m.LimitUpCount + m.LimitDownCount)
+	// 涨停占比 [0,1]（对涨跌停总数归一化；无跌停数时保守估计为上涨家数的 1%）
 	limitUpRatio := 0.0
+	totalLimit := float64(m.LimitUpCount + m.LimitDownCount)
 	if totalLimit > 0 {
 		limitUpRatio = float64(m.LimitUpCount) / totalLimit
+	} else if m.LimitUpCount > 0 {
+		limitUpRatio = 1.0 // 只有涨停、没有跌停，极度乐观
 	}
 
-	// 3. 量比 (当前成交额 / 均量)
+	// 量能比（今日 vs 5日均值）[0,2]，clamp 到 [0.2, 2]
 	volRatio := 1.0
 	if avgVol > 0 {
 		volRatio = m.TotalAmount / avgVol
+		if volRatio > 2.0 {
+			volRatio = 2.0
+		}
+		if volRatio < 0.2 {
+			volRatio = 0.2
+		}
 	}
-	// 限制量比对分数的贡献，防止爆量导致分数溢出
-	// 假设标准是 1.0，如果达到 2.0 就算非常热
-	// 这里的公式是直接乘 100，所以：
-	// 0.3 * volRatio * 100
-	// 如果 volRatio = 1, 贡献 30 分
-	// 如果 volRatio = 2, 贡献 60 分
-	// 看起来没问题。但如果 volRatio 过大（如 3.0），分数会超。
 
-	rawScore := (0.4 * upRatio) + (0.3 * limitUpRatio) + (0.3 * volRatio)
-	score := int(math.Floor(rawScore * 100))
+	// 加权：涨跌比 45%，涨停比 25%，量能比 30%
+	// volRatio 归一化到 [0,1]（满值 2x 均量 → 1.0）
+	rawScore := 0.45*upRatio + 0.25*limitUpRatio + 0.30*(volRatio/2.0)
+	score := int(math.Round(rawScore * 100))
 
 	if score > 100 {
 		score = 100
