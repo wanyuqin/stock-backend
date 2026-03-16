@@ -62,22 +62,43 @@ type AlertRepo interface {
 
 // PositionGuardianRepo 持仓明细 & 诊断快照访问接口。
 type PositionGuardianRepo interface {
-	// ListAll 返回所有 quantity>0 的持仓
 	ListAll(ctx context.Context) ([]*model.PositionDetail, error)
-	// GetByCode 按股票代码查单条
 	GetByCode(ctx context.Context, code string) (*model.PositionDetail, error)
-	// Upsert 按 stock_code 唯一键插入或更新
 	Upsert(ctx context.Context, p *model.PositionDetail) error
-	// SaveDiagnostic 写入诊断快照
 	SaveDiagnostic(ctx context.Context, d *model.PositionDiagnostic) error
 }
 
 // SnapshotRepo 全市场每日快照访问接口。
 type SnapshotRepo interface {
-	// BulkUpsert 批量写入/更新快照（ON CONFLICT (trade_date, code) DO UPDATE）。
 	BulkUpsert(ctx context.Context, snapshots []*model.StockDailySnapshot) error
-	// ListByDate 读取某日全量快照，供筛选器内存打分。
 	ListByDate(ctx context.Context, date time.Time) ([]*model.StockDailySnapshot, error)
-	// CountByDate 返回某日快照总数（快速健康检查）。
 	CountByDate(ctx context.Context, date time.Time) (int64, error)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// StockReportRepo 研报数据访问接口。
+// ─────────────────────────────────────────────────────────────────
+
+// StockReportQuery 分页查询参数。
+type StockReportQuery struct {
+	StockCode string // 可选，按代码筛选
+	Page      int    // 从 1 开始
+	Limit     int    // 每页条数，默认 20，最大 100
+}
+
+// StockReportPage 分页查询结果。
+type StockReportPage struct {
+	Total int64                 `json:"total"`
+	Items []*model.StockReport  `json:"items"`
+}
+
+type StockReportRepo interface {
+	// BulkUpsert 批量写入，info_code 冲突时忽略（幂等）
+	BulkUpsert(ctx context.Context, reports []*model.StockReport) (int64, error)
+	// ListPending 查询尚未处理 AI 摘要的记录
+	ListPending(ctx context.Context, limit int) ([]*model.StockReport, error)
+	// UpdateAISummary 更新 AI 摘要，标记已处理
+	UpdateAISummary(ctx context.Context, id int64, summary string) error
+	// List 分页查询（支持 stock_code 筛选）
+	List(ctx context.Context, q StockReportQuery) (*StockReportPage, error)
 }

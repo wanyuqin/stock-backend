@@ -13,33 +13,22 @@ import (
 // 接口定义
 // ═══════════════════════════════════════════════════════════════
 
-// ReviewRepo 复盘记录数据访问接口。
 type ReviewRepo interface {
-	// Create 创建复盘记录（幂等，trade_log_id 冲突时返回已存在的记录）
 	Create(ctx context.Context, r *model.TradeReview) error
-	// GetByTradeLogID 按关联交易ID查询
 	GetByTradeLogID(ctx context.Context, tradeLogID int64) (*model.TradeReview, error)
-	// GetByID 按主键查询
 	GetByID(ctx context.Context, id int64) (*model.TradeReview, error)
-	// Update 更新字段（全字段覆盖）
+	// GetWithTradeByID 按 review id 查询，同时 JOIN trade_logs 返回完整信息
+	GetWithTradeByID(ctx context.Context, id int64) (*TradeReviewWithTrade, error)
 	Update(ctx context.Context, r *model.TradeReview) error
-	// ListPending 查询需要价格追踪的记录（PENDING / PARTIAL）
 	ListPending(ctx context.Context) ([]*model.TradeReview, error)
-	// ListByUser 查询用户全量复盘，支持分页
 	ListByUser(ctx context.Context, userID int64, limit, offset int) ([]*TradeReviewWithTrade, error)
-	// CountByUser 统计总数
 	CountByUser(ctx context.Context, userID int64) (int64, error)
-	// DashboardStats 聚合看板数据
 	DashboardStats(ctx context.Context, userID int64) (*DashboardStats, error)
 }
 
-// TradeLogV2Repo 扩展交易日志访问（含 buy_reason / sell_reason）。
 type TradeLogV2Repo interface {
-	// GetSellsInRange 查询时间范围内所有 SELL 记录
 	GetSellsInRange(ctx context.Context, userID int64, from, to time.Time) ([]*model.TradeLogV2, error)
-	// GetMatchedBuy 查找与卖出相匹配的最近一次买入（同 code、买入时间 < 卖出时间）
 	GetMatchedBuy(ctx context.Context, userID int64, code string, sellTime time.Time) (*model.TradeLogV2, error)
-	// UpdateReasons 更新买入/卖出理由
 	UpdateReasons(ctx context.Context, id int64, buyReason, sellReason string) error
 }
 
@@ -47,53 +36,39 @@ type TradeLogV2Repo interface {
 // 聚合数据结构
 // ─────────────────────────────────────────────────────────────────
 
-// TradeReviewWithTrade 复盘记录 + 关联的卖出交易信息
+// TradeReviewWithTrade 复盘记录 + 关联的卖出交易信息（JOIN 结果）
 type TradeReviewWithTrade struct {
 	model.TradeReview
-	// 来自 trade_logs 的冗余字段（JOIN）
-	TradePrice  float64   `json:"trade_price"`
-	TradeVolume int64     `json:"trade_volume"`
-	TradedAt    time.Time `json:"traded_at"`
-	BuyReason   string    `json:"buy_reason"`
-	SellReason  string    `json:"sell_reason"`
-	StockName   string    `json:"stock_name"`
+	TradePrice  float64   `json:"trade_price"  gorm:"column:trade_price"`
+	TradeVolume int64     `json:"trade_volume" gorm:"column:trade_volume"`
+	TradedAt    time.Time `json:"traded_at"    gorm:"column:traded_at"`
+	BuyReason   string    `json:"buy_reason"   gorm:"column:buy_reason"`
+	SellReason  string    `json:"sell_reason"  gorm:"column:sell_reason"`
+	StockName   string    `json:"stock_name"   gorm:"column:stock_name"`
 }
 
-// MentalStateStat 单个情绪状态的统计
 type MentalStateStat struct {
 	MentalState string  `json:"mental_state"`
 	Count       int64   `json:"count"`
-	AvgPnlPct   float64 `json:"avg_pnl_pct"` // 平均盈亏%
-	WinRate     float64 `json:"win_rate"`    // 胜率%
+	AvgPnlPct   float64 `json:"avg_pnl_pct"`
+	WinRate     float64 `json:"win_rate"`
 }
 
-// DashboardStats 看板聚合数据
 type DashboardStats struct {
-	// 胜率统计
-	TotalReviews int64   `json:"total_reviews"`
-	WinCount     int64   `json:"win_count"`
-	WinRate      float64 `json:"win_rate"` // 盈利次数/总次数
-
-	// 逻辑一致率
-	LogicConsistentCount int64   `json:"logic_consistent_count"` // ConsistencyFlag = NORMAL
-	LogicConsistencyRate float64 `json:"logic_consistency_rate"` // 一致次数/总次数
-	LuckyWinCount        int64   `json:"lucky_win_count"`        // 盈利但有逻辑冲突
-	LuckyWinRate         float64 `json:"lucky_win_rate"`         // 瞎猫碰死耗子比例
-
-	// 情绪热力图
-	MentalStateStats []*MentalStateStat `json:"mental_state_stats"`
-
-	// 卖飞分析
-	AvgRegretIndex float64 `json:"avg_regret_index"` // 平均后悔指数
-	MaxRegretIndex float64 `json:"max_regret_index"` // 最大后悔指数
-	RegretCount    int64   `json:"regret_count"`     // price_5d_after > price_at_sell 的次数
-	RegretRate     float64 `json:"regret_rate"`      // 卖飞比例
-
-	// 执行力
-	AvgExecutionScore float64 `json:"avg_execution_score"`
-
-	// 最近活动
-	LastReviewAt *time.Time `json:"last_review_at"`
+	TotalReviews         int64   `json:"total_reviews"`
+	WinCount             int64   `json:"win_count"`
+	WinRate              float64 `json:"win_rate"`
+	LogicConsistentCount int64   `json:"logic_consistent_count"`
+	LogicConsistencyRate float64 `json:"logic_consistency_rate"`
+	LuckyWinCount        int64   `json:"lucky_win_count"`
+	LuckyWinRate         float64 `json:"lucky_win_rate"`
+	MentalStateStats     []*MentalStateStat `json:"mental_state_stats"`
+	AvgRegretIndex       float64 `json:"avg_regret_index"`
+	MaxRegretIndex       float64 `json:"max_regret_index"`
+	RegretCount          int64   `json:"regret_count"`
+	RegretRate           float64 `json:"regret_rate"`
+	AvgExecutionScore    float64 `json:"avg_execution_score"`
+	LastReviewAt         *time.Time `json:"last_review_at"`
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -134,6 +109,34 @@ func (r *gormReviewRepo) GetByID(ctx context.Context, id int64) (*model.TradeRev
 	return &rev, nil
 }
 
+// GetWithTradeByID 用单条 JOIN 查询替代原来 ListByUser(1000) + 遍历的低效做法
+func (r *gormReviewRepo) GetWithTradeByID(ctx context.Context, id int64) (*TradeReviewWithTrade, error) {
+	var item TradeReviewWithTrade
+	err := r.db.WithContext(ctx).Raw(`
+		SELECT
+			tr.*,
+			tl.price        AS trade_price,
+			tl.volume       AS trade_volume,
+			tl.traded_at    AS traded_at,
+			tl.buy_reason   AS buy_reason,
+			tl.sell_reason  AS sell_reason,
+			COALESCE(s.name, tr.stock_code) AS stock_name
+		FROM trade_reviews tr
+		INNER JOIN trade_logs tl ON tl.id = tr.trade_log_id
+		LEFT JOIN stocks s ON s.code = tr.stock_code
+		WHERE tr.id = ?
+		LIMIT 1
+	`, id).Scan(&item).Error
+	if err != nil {
+		return nil, err
+	}
+	// Scan 不报 not found，检查主键
+	if item.ID == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return &item, nil
+}
+
 func (r *gormReviewRepo) Update(ctx context.Context, rev *model.TradeReview) error {
 	return r.db.WithContext(ctx).Save(rev).Error
 }
@@ -147,8 +150,10 @@ func (r *gormReviewRepo) ListPending(ctx context.Context) ([]*model.TradeReview,
 	return reviews, err
 }
 
+// ListByUser FIX: 改用 Scan 到 slice，避免 ScanRows 对嵌套 struct 的支持问题
 func (r *gormReviewRepo) ListByUser(ctx context.Context, userID int64, limit, offset int) ([]*TradeReviewWithTrade, error) {
-	rows, err := r.db.WithContext(ctx).Raw(`
+	var result []*TradeReviewWithTrade
+	err := r.db.WithContext(ctx).Raw(`
 		SELECT
 			tr.*,
 			tl.price        AS trade_price,
@@ -163,21 +168,14 @@ func (r *gormReviewRepo) ListByUser(ctx context.Context, userID int64, limit, of
 		WHERE tl.user_id = ?
 		ORDER BY tr.created_at DESC
 		LIMIT ? OFFSET ?
-	`, userID, limit, offset).Rows()
+	`, userID, limit, offset).Scan(&result).Error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []*TradeReviewWithTrade
-	for rows.Next() {
-		var item TradeReviewWithTrade
-		if err := r.db.ScanRows(rows, &item); err != nil {
-			return nil, err
-		}
-		result = append(result, &item)
+	if result == nil {
+		result = []*TradeReviewWithTrade{}
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
 func (r *gormReviewRepo) CountByUser(ctx context.Context, userID int64) (int64, error) {
@@ -194,7 +192,6 @@ func (r *gormReviewRepo) CountByUser(ctx context.Context, userID int64) (int64, 
 func (r *gormReviewRepo) DashboardStats(ctx context.Context, userID int64) (*DashboardStats, error) {
 	stats := &DashboardStats{}
 
-	// ── 基础聚合 ────────────────────────────────────────────────
 	type baseRow struct {
 		TotalReviews         int64   `gorm:"column:total_reviews"`
 		WinCount             int64   `gorm:"column:win_count"`
@@ -235,7 +232,7 @@ func (r *gormReviewRepo) DashboardStats(ctx context.Context, userID int64) (*Das
 	stats.WinCount = base.WinCount
 	stats.LogicConsistentCount = base.LogicConsistentCount
 	stats.LuckyWinCount = base.LuckyWinCount
-	stats.AvgRegretIndex = round2(base.AvgRegretIndex * 100) // 转为%
+	stats.AvgRegretIndex = round2(base.AvgRegretIndex * 100)
 	stats.MaxRegretIndex = round2(base.MaxRegretIndex * 100)
 	stats.RegretCount = base.RegretCount
 	stats.AvgExecutionScore = round2(base.AvgExecutionScore)
@@ -244,7 +241,7 @@ func (r *gormReviewRepo) DashboardStats(ctx context.Context, userID int64) (*Das
 		stats.WinRate = round2(float64(base.WinCount) / float64(base.TotalReviews) * 100)
 		stats.LogicConsistencyRate = round2(float64(base.LogicConsistentCount) / float64(base.TotalReviews) * 100)
 	}
-	// 卖飞比例（相对于追踪完成的记录）
+
 	var completedCount int64
 	r.db.WithContext(ctx).Raw(`
 		SELECT COUNT(*) FROM trade_reviews tr
@@ -258,7 +255,6 @@ func (r *gormReviewRepo) DashboardStats(ctx context.Context, userID int64) (*Das
 		stats.LuckyWinRate = round2(float64(base.LuckyWinCount) / float64(base.WinCount) * 100)
 	}
 
-	// ── 情绪热力图 ────────────────────────────────────────────
 	type mentalRow struct {
 		MentalState string  `gorm:"column:mental_state"`
 		Count       int64   `gorm:"column:count"`
@@ -290,8 +286,10 @@ func (r *gormReviewRepo) DashboardStats(ctx context.Context, userID int64) (*Das
 		}
 		stats.MentalStateStats = append(stats.MentalStateStats, stat)
 	}
+	if stats.MentalStateStats == nil {
+		stats.MentalStateStats = []*MentalStateStat{}
+	}
 
-	// ── 最近活动时间 ──────────────────────────────────────────
 	var lastTime time.Time
 	r.db.WithContext(ctx).Raw(`
 		SELECT MAX(tr.created_at)
@@ -345,13 +343,20 @@ func (r *gormTradeLogV2Repo) GetMatchedBuy(
 }
 
 func (r *gormTradeLogV2Repo) UpdateReasons(ctx context.Context, id int64, buyReason, sellReason string) error {
+	updates := map[string]interface{}{}
+	if buyReason != "" {
+		updates["buy_reason"] = buyReason
+	}
+	if sellReason != "" {
+		updates["sell_reason"] = sellReason
+	}
+	if len(updates) == 0 {
+		return nil
+	}
 	return r.db.WithContext(ctx).
 		Model(&model.TradeLogV2{}).
 		Where("id = ?", id).
-		Updates(map[string]interface{}{
-			"buy_reason":  buyReason,
-			"sell_reason": sellReason,
-		}).Error
+		Updates(updates).Error
 }
 
 func round2(v float64) float64 {

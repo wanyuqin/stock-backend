@@ -33,8 +33,8 @@ func main() {
 		log.Sugar().Fatalw("failed to connect database", "err", err)
 	}
 
-	// ── 4. 构建路由（同时返回后台服务引用）────────────────────────
-	ginEngine, discoverySvc, auditSvc, marketSentinelSvc := router.New(cfg, log)
+	// ── 4. 构建路由 ───────────────────────────────────────────────
+	ginEngine, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc := router.New(cfg, log)
 
 	// ── 5. 启动后台服务 ───────────────────────────────────────────
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -43,11 +43,14 @@ func main() {
 	// 主力脉冲轮询
 	discoverySvc.Start(bgCtx)
 
-	// 全市场宏观监控 (Market Sentinel)
+	// 全市场宏观监控
 	marketSentinelSvc.Start(bgCtx)
 
-	// 复盘价格追踪器：每天 16:05 自动运行
+	// 复盘价格追踪器（每日 16:05）
 	go runDailyPriceTracker(bgCtx, auditSvc, log)
+
+	// 研报情报站（每 6h 同步 + 每 10min AI 摘要）
+	go runReportWorkers(bgCtx, stockReportSvc, log)
 
 	// ── 6. 启动 HTTP Server ───────────────────────────────────────
 	srv := &http.Server{

@@ -12,7 +12,13 @@ import (
 	"stock-backend/internal/service"
 )
 
-func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoveryService, *service.AuditService, *service.MarketSentinelService) {
+func New(cfg *config.Config, log *zap.Logger) (
+	*gin.Engine,
+	*service.DiscoveryService,
+	*service.AuditService,
+	*service.MarketSentinelService,
+	*service.StockReportService,
+) {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -24,44 +30,51 @@ func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoverySe
 
 	db := data.DB()
 
-	stockRepo := repo.NewStockRepo(db)
-	watchlistRepo := repo.NewWatchlistRepo(db)
-	tradeRepo := repo.NewTradeLogRepo(db)
-	scanRepo := repo.NewScanRepo(db)
-	mfRepo := repo.NewMoneyFlowRepo(db)
-	alertRepo := repo.NewAlertRepo(db)
-	snapshotRepo := repo.NewSnapshotRepo(db)
-	positionRepo := repo.NewPositionRepo(db)
-	reviewRepo := repo.NewReviewRepo(db)
-	tradeV2Repo := repo.NewTradeLogV2Repo(db)
+	// ── Repo 层 ──────────────────────────────────────────────────
+	stockRepo           := repo.NewStockRepo(db)
+	watchlistRepo        := repo.NewWatchlistRepo(db)
+	tradeRepo           := repo.NewTradeLogRepo(db)
+	scanRepo            := repo.NewScanRepo(db)
+	mfRepo              := repo.NewMoneyFlowRepo(db)
+	alertRepo           := repo.NewAlertRepo(db)
+	snapshotRepo        := repo.NewSnapshotRepo(db)
+	positionRepo        := repo.NewPositionRepo(db)
+	reviewRepo          := repo.NewReviewRepo(db)
+	tradeV2Repo         := repo.NewTradeLogV2Repo(db)
 	marketSentimentRepo := repo.NewMarketSentimentRepo(db)
+	stockReportRepo     := repo.NewStockReportRepo(db)
 
-	stockSvc := service.NewStockService(log)
-	aiSvc := service.NewAIAnalysisService(log)
-	tradeSvc := service.NewTradeService(tradeRepo, stockSvc, log)
-	scanSvc := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
-	reportSvc := service.NewReportService(scanRepo, aiSvc, log)
-	mfSvc := service.NewMoneyFlowService(mfRepo, stockRepo, log)
-	discoverySvc := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
-	crawlerSvc := service.NewCrawlerService(snapshotRepo, log)
-	screenerSvc := service.NewScreenerService(snapshotRepo, log)
-	guardianSvc := service.NewPositionGuardianService(positionRepo, stockSvc, aiSvc, log)
-	auditSvc := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
+	// ── Service 层 ───────────────────────────────────────────────
+	stockSvc          := service.NewStockService(log)
+	aiSvc             := service.NewAIAnalysisService(log)
+	tradeSvc          := service.NewTradeService(tradeRepo, stockSvc, log)
+	scanSvc           := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
+	reportSvc         := service.NewReportService(scanRepo, aiSvc, log)
+	mfSvc             := service.NewMoneyFlowService(mfRepo, stockRepo, log)
+	discoverySvc      := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
+	crawlerSvc        := service.NewCrawlerService(snapshotRepo, log)
+	screenerSvc       := service.NewScreenerService(snapshotRepo, log)
+	guardianSvc       := service.NewPositionGuardianService(positionRepo, stockSvc, aiSvc, log)
+	auditSvc          := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
 	marketSentinelSvc := service.NewMarketSentinelService(marketSentimentRepo, log)
+	stockReportSvc    := service.NewStockReportService(stockReportRepo, aiSvc, log)
 
-	stockHandler := handler.NewStockHandler(stockRepo, stockSvc, log)
-	watchlistHandler := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
-	analysisHandler := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
-	tradeHandler := handler.NewTradeHandler(tradeSvc, log)
-	scanHandler := handler.NewScanHandler(scanSvc, reportSvc, log)
-	reportHandler := handler.NewReportHandler(reportSvc, log)
-	alertHandler := handler.NewAlertHandler(discoverySvc, mfSvc, log)
-	screenerHandler := handler.NewScreenerHandler(screenerSvc, crawlerSvc, log)
-	positionHandler := handler.NewPositionHandler(guardianSvc, log)
-	reviewHandler := handler.NewReviewHandler(auditSvc, log)
+	// ── Handler 层 ───────────────────────────────────────────────
+	stockHandler          := handler.NewStockHandler(stockRepo, stockSvc, log)
+	watchlistHandler      := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
+	analysisHandler       := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
+	tradeHandler          := handler.NewTradeHandler(tradeSvc, log)
+	scanHandler           := handler.NewScanHandler(scanSvc, reportSvc, log)
+	reportHandler         := handler.NewReportHandler(reportSvc, log)
+	alertHandler          := handler.NewAlertHandler(discoverySvc, mfSvc, log)
+	screenerHandler       := handler.NewScreenerHandler(screenerSvc, crawlerSvc, log)
+	positionHandler       := handler.NewPositionHandler(guardianSvc, log)
+	reviewHandler         := handler.NewReviewHandler(auditSvc, log)
 	marketSentinelHandler := handler.NewMarketSentinelHandler(marketSentinelSvc, log)
-	healthHandler := handler.NewHealthHandler()
+	stockReportHandler    := handler.NewStockReportHandler(stockReportSvc, log)
+	healthHandler         := handler.NewHealthHandler()
 
+	// ── 路由 ─────────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
 	r.GET("/readyz", healthHandler.Ready)
 
@@ -87,15 +100,12 @@ func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoverySe
 
 		trades := v1.Group("/trades")
 		{
-			// GET  /trades        — 全量流水（traded_at 倒序，limit/offset 分页）
-			// POST /trades        — 新增一条交易记录
-			// GET  /trades/:code  — 按股票代码查历史
 			trades.GET("", tradeHandler.ListAll)
 			trades.POST("", tradeHandler.AddTrade)
 			trades.GET("/:code", tradeHandler.ListByCode)
 		}
 
-		// 复盘系统 API
+		// 复盘系统
 		review := v1.Group("/review")
 		{
 			review.POST("/submit", reviewHandler.Submit)
@@ -108,10 +118,19 @@ func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoverySe
 
 		v1.Group("/stats").GET("/performance", tradeHandler.GetPerformance)
 
+		// 每日复盘简报（原有）
 		reports := v1.Group("/reports")
 		{
 			reports.GET("/daily", reportHandler.GetDailyReport)
 			reports.POST("/daily/generate", reportHandler.GenerateDailyReport)
+		}
+
+		// 研报情报站（新增）
+		intel := v1.Group("/reports/intel")
+		{
+			intel.GET("", stockReportHandler.List)              // 分页查询
+			intel.POST("/sync", stockReportHandler.Sync)        // 手动同步
+			intel.POST("/ai", stockReportHandler.ProcessAI)     // 手动触发 AI 摘要
 		}
 
 		alerts := v1.Group("/alerts")
@@ -156,5 +175,5 @@ func New(cfg *config.Config, log *zap.Logger) (*gin.Engine, *service.DiscoverySe
 		}
 	}
 
-	return r, discoverySvc, auditSvc, marketSentinelSvc
+	return r, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc
 }

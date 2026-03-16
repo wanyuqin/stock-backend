@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,93 +13,145 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════
-// 统一行情数据结构
+// 接口说明（经实际抓包验证，2026-03）
+//
+// ❌ push2.eastmoney.com/api/qt/stock/get  → TCP RST，已全线不可用
+// ✅ push2.eastmoney.com/api/qt/ulist.np/get → 正常，支持批量 secids
+//
+// ulist.np 字段映射（fltt=2，数值直接为浮点，无需 ÷100）：
+//   f12 = 股票代码      f13 = 市场(1=SH, 0=SZ)   f14 = 股票名称
+//   f2  = 当前价        f3  = 涨跌幅(%)            f4  = 涨跌额
+//   f5  = 成交量(手)    f6  = 成交额(元)            f7  = 振幅(%)
+//   f8  = 换手率(%)     f9  = 市盈率               f10 = 量比
+//   f15 = 最高价        f16 = 最低价               f17 = 今开
+//   f18 = 昨收价        f20 = 总市值               f21 = 流通市值
+//   f23 = 市净率
 // ═══════════════════════════════════════════════════════════════
 
-// Quote 是对外暴露的统一实时行情结构，屏蔽东方财富的 f43/f44 字段命名。
+// ─────────────────────────────────────────────────────────────────
+// Quote — 统一行情结构（字段语义不变，底层接口已换）
+// ─────────────────────────────────────────────────────────────────
+
 type Quote struct {
-	Code        string    `json:"code"`          // 股票代码，如 "600519"
-	Name        string    `json:"name"`          // 股票名称，如 "贵州茅台"
-	Market      string    `json:"market"`        // "SH" | "SZ"
-	Price       float64   `json:"price"`         // 当前价（f43）
-	Open        float64   `json:"open"`          // 开盘价（f46）
-	Close       float64   `json:"close"`         // 昨收价（f60）
-	High        float64   `json:"high"`          // 最高价（f44）
-	Low         float64   `json:"low"`           // 最低价（f45）
-	Volume      int64     `json:"volume"`        // 成交量，手（f47）
-	Amount      float64   `json:"amount"`        // 成交额，元（f48）
-	Change      float64   `json:"change"`        // 涨跌额（f169）
-	ChangeRate  float64   `json:"change_rate"`   // 涨跌幅，%（f170）
-	Turnover    float64   `json:"turnover"`      // 换手率，%（f168）
-	VolumeRatio float64   `json:"volume_ratio"`  // 量比（f50）
-	UpdatedAt   time.Time `json:"updated_at"`    // 本次数据获取时间
-	FromCache   bool      `json:"from_cache"`    // 是否来自缓存
+	Code        string    `json:"code"`
+	Name        string    `json:"name"`
+	Market      string    `json:"market"`       // "SH" | "SZ"
+	Price       float64   `json:"price"`        // 当前价
+	Open        float64   `json:"open"`         // 今开
+	Close       float64   `json:"close"`        // 昨收
+	High        float64   `json:"high"`         // 最高
+	Low         float64   `json:"low"`          // 最低
+	Volume      int64     `json:"volume"`       // 成交量（手）
+	Amount      float64   `json:"amount"`       // 成交额（元）
+	Change      float64   `json:"change"`       // 涨跌额
+	ChangeRate  float64   `json:"change_rate"`  // 涨跌幅（%）
+	Turnover    float64   `json:"turnover"`     // 换手率（%）
+	VolumeRatio float64   `json:"volume_ratio"` // 量比
+	UpdatedAt   time.Time `json:"updated_at"`
+	FromCache   bool      `json:"from_cache"`
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 东方财富 API 原始响应结构
-// ═══════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
+// ulist.np 原始响应结构
+// ─────────────────────────────────────────────────────────────────
 
-// emResponse 是东方财富 /api/qt/stock/get 接口的顶层响应。
-type emResponse struct {
-	Data    emData `json:"data"`
-	Code    int    `json:"code"` // 0 = 成功
-	Message string `json:"message"`
+type ulistNpResp struct {
+	RC   int    `json:"rc"` // 0 = 成功
+	Data *struct {
+		Total int            `json:"total"`
+		Diff  []ulistNpItem  `json:"diff"`
+	} `json:"data"`
 }
 
-// emData 是 data 字段，所有行情都在 diff 节点。
-// 注意：东方财富将价格 ×100 后作为整数返回（fltt=2 模式返回浮点字符串）。
-// 本实现使用 fltt=2，价格直接是浮点数字符串，无需手动 /100。
-type emData struct {
-	// 东方财富把每个字段都直接放在 data 对象里
-	F43  json.RawMessage `json:"f43"`  // 当前价
-	F44  json.RawMessage `json:"f44"`  // 最高
-	F45  json.RawMessage `json:"f45"`  // 最低
-	F46  json.RawMessage `json:"f46"`  // 开盘
-	F47  json.RawMessage `json:"f47"`  // 成交量（手）
-	F48  json.RawMessage `json:"f48"`  // 成交额（元）
-	F50  json.RawMessage `json:"f50"`  // 量比
-	F57  string          `json:"f57"`  // 股票代码
-	F58  string          `json:"f58"`  // 股票名称
-	F60  json.RawMessage `json:"f60"`  // 昨收价
-	F168 json.RawMessage `json:"f168"` // 换手率（%）
-	F169 json.RawMessage `json:"f169"` // 涨跌额
-	F170 json.RawMessage `json:"f170"` // 涨跌幅（%）
+// ulistNpItem 用 json.Number 兼容数字和 "-"（非交易时段字段值为 "-"）。
+type ulistNpItem struct {
+	F12 string      `json:"f12"` // 股票代码
+	F13 int         `json:"f13"` // 市场：1=SH, 0=SZ
+	F14 string      `json:"f14"` // 股票名称
+	F2  json.Number `json:"f2"`  // 当前价
+	F3  json.Number `json:"f3"`  // 涨跌幅(%)
+	F4  json.Number `json:"f4"`  // 涨跌额
+	F5  json.Number `json:"f5"`  // 成交量(手)
+	F6  json.Number `json:"f6"`  // 成交额(元)
+	F8  json.Number `json:"f8"`  // 换手率(%)
+	F10 json.Number `json:"f10"` // 量比
+	F15 json.Number `json:"f15"` // 最高价
+	F16 json.Number `json:"f16"` // 最低价
+	F17 json.Number `json:"f17"` // 今开
+	F18 json.Number `json:"f18"` // 昨收
+	F20 json.Number `json:"f20"` // 总市值
+	F21 json.Number `json:"f21"` // 流通市值
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MarketProvider：实时行情抓取服务
-// ═══════════════════════════════════════════════════════════════
+// toQuote 将 ulistNpItem 转换为 Quote。
+func (item *ulistNpItem) toQuote() *Quote {
+	market := "SZ"
+	if item.F13 == 1 {
+		market = "SH"
+	}
+
+	price := jnf(item.F2)
+	closePrice := jnf(item.F18)
+
+	// 非交易时段 price=0，用昨收兜底
+	if price == 0 && closePrice > 0 {
+		price = closePrice
+	}
+
+	return &Quote{
+		Code:        item.F12,
+		Name:        item.F14,
+		Market:      market,
+		Price:       price,
+		Open:        jnf(item.F17),
+		Close:       closePrice,
+		High:        jnf(item.F15),
+		Low:         jnf(item.F16),
+		Volume:      int64(jnf(item.F5)),
+		Amount:      jnf(item.F6),
+		Change:      jnf(item.F4),
+		ChangeRate:  jnf(item.F3),
+		Turnover:    jnf(item.F8),
+		VolumeRatio: jnf(item.F10),
+		UpdatedAt:   time.Now(),
+		FromCache:   false,
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MarketProvider
+// ─────────────────────────────────────────────────────────────────
 
 const (
-	emBaseURL  = "https://push2.eastmoney.com/api/qt/stock/get"
-	emUt       = "fa5fd1943c7b386f172d6893dbfba10b"
-	emFields   = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f168,f169,f170"
-	cacheTTL   = 5 * time.Second  // 缓存有效期
-	httpTimeout = 8 * time.Second // HTTP 超时
+	emUlistNpURL  = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+	emUlistUt     = "bd1d9ddb04089700cf9c27f6f7426281"
+	// 请求的字段列表（不含 f7/f9/f23，减小响应体积）
+	emUlistFields = "f12,f13,f14,f2,f3,f4,f5,f6,f8,f10,f15,f16,f17,f18,f20,f21"
+
+	cacheTTL    = 5 * time.Second
+	httpTimeout = 8 * time.Second
+
+	// 每批最多 50 只，避免 URL 过长
+	batchSize = 50
 )
 
-// MarketProvider 封装行情抓取 + 内存缓存逻辑。
+// MarketProvider 封装行情抓取 + 内存缓存。
 type MarketProvider struct {
 	httpClient *http.Client
-	cache      *gocache.Cache // 内存缓存，TTL = 5s
+	cache      *gocache.Cache
 	log        *zap.Logger
 }
 
-// NewMarketProvider 创建一个 MarketProvider 实例。
-// 推荐在应用启动时调用一次，全局复用（http.Client 是并发安全的）。
 func NewMarketProvider(log *zap.Logger) *MarketProvider {
 	return &MarketProvider{
 		httpClient: &http.Client{
 			Timeout: httpTimeout,
-			// 连接池复用，避免每次请求都建立 TCP 连接
 			Transport: &http.Transport{
 				MaxIdleConns:        20,
 				MaxIdleConnsPerHost: 10,
 				IdleConnTimeout:     30 * time.Second,
 			},
 		},
-		// 缓存默认 TTL = 5s，每 30s 清理一次过期 key
 		cache: gocache.New(cacheTTL, 30*time.Second),
 		log:   log,
 	}
@@ -110,75 +161,101 @@ func NewMarketProvider(log *zap.Logger) *MarketProvider {
 // 公开方法
 // ─────────────────────────────────────────────────────────────────
 
-// FetchRealtimeQuote 获取单只股票的实时行情。
-// 缓存策略：5 秒内的相同 code 直接返回缓存，不发起 HTTP 请求。
-//
-// code 格式：纯数字代码，如 "600519"、"000858"
-// 市场判断规则：6 开头 → 沪市（SH，secid=1.xxx），其余 → 深市（SZ，secid=0.xxx）
+// FetchRealtimeQuote 获取单只股票实时行情。
+// 5s 内相同 code 直接返回缓存，不发起 HTTP 请求。
 func (p *MarketProvider) FetchRealtimeQuote(code string) (*Quote, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return nil, fmt.Errorf("stock code is empty")
 	}
 
-	// ── 1. 先查缓存 ───────────────────────────────────────────────
+	// 1. 查缓存
 	cacheKey := "quote:" + code
 	if cached, found := p.cache.Get(cacheKey); found {
 		q := cached.(*Quote)
-		q.FromCache = true
+		cp := *q // 拷贝一份，避免 FromCache 污染缓存对象
+		cp.FromCache = true
 		p.log.Sugar().Debugw("cache hit", "code", code)
-		return q, nil
+		return &cp, nil
 	}
 
-	// ── 2. 缓存未命中，发起 HTTP 请求 ─────────────────────────────
-	quote, err := p.fetchFromEastMoney(code)
+	// 2. 缓存未命中，通过批量接口拉取（单只也用 ulist.np，保持一致）
+	results, err := p.fetchBatch([]string{code})
 	if err != nil {
-		return nil, fmt.Errorf("fetchRealtimeQuote(%s): %w", code, err)
+		return nil, fmt.Errorf("FetchRealtimeQuote(%s): %w", code, err)
+	}
+	q, ok := results[code]
+	if !ok {
+		return nil, fmt.Errorf("FetchRealtimeQuote(%s): not found in response", code)
 	}
 
-	// ── 3. 写入缓存 ───────────────────────────────────────────────
-	p.cache.Set(cacheKey, quote, cacheTTL)
-	p.log.Sugar().Debugw("fetched and cached",
-		"code", code,
-		"price", quote.Price,
-		"change_rate", quote.ChangeRate,
-	)
-
-	return quote, nil
+	// 3. 写缓存
+	p.cache.Set(cacheKey, q, cacheTTL)
+	p.log.Sugar().Debugw("fetched",
+		"code", code, "price", q.Price, "change_rate", q.ChangeRate)
+	return q, nil
 }
 
-// FetchMultipleQuotes 批量获取多只股票的实时行情（并发抓取）。
-// 返回 map[code]*Quote，失败的 code 不会出现在结果中，错误单独收集。
+// FetchMultipleQuotes 批量获取多只股票实时行情。
+// 先查内存缓存，剩余 miss 的按 batchSize 分批并发请求 ulist.np。
+// 返回 map[code]*Quote，失败的 code 不出现在结果中。
 func (p *MarketProvider) FetchMultipleQuotes(codes []string) (map[string]*Quote, []error) {
-	type result struct {
-		code  string
-		quote *Quote
-		err   error
+	if len(codes) == 0 {
+		return map[string]*Quote{}, nil
 	}
 
-	ch := make(chan result, len(codes))
+	// 1. 先走缓存
+	missing := make([]string, 0, len(codes))
+	results := make(map[string]*Quote, len(codes))
 	for _, code := range codes {
-		go func(c string) {
-			q, err := p.FetchRealtimeQuote(c)
-			ch <- result{code: c, quote: q, err: err}
-		}(code)
+		if cached, found := p.cache.Get("quote:" + code); found {
+			q := cached.(*Quote)
+			cp := *q
+			cp.FromCache = true
+			results[code] = &cp
+		} else {
+			missing = append(missing, code)
+		}
 	}
 
-	quotes := make(map[string]*Quote, len(codes))
+	if len(missing) == 0 {
+		return results, nil
+	}
+
+	// 2. 分批并发请求
+	type batchResult struct {
+		quotes map[string]*Quote
+		err    error
+	}
+
+	batches := splitBatches(missing, batchSize)
+	ch := make(chan batchResult, len(batches))
+
+	for _, batch := range batches {
+		go func(b []string) {
+			q, err := p.fetchBatch(b)
+			ch <- batchResult{quotes: q, err: err}
+		}(batch)
+	}
+
 	var errs []error
-	for range codes {
+	for range batches {
 		r := <-ch
 		if r.err != nil {
 			errs = append(errs, r.err)
-			p.log.Sugar().Warnw("fetch failed", "code", r.code, "err", r.err)
-		} else {
-			quotes[r.code] = r.quote
+			p.log.Warn("FetchMultipleQuotes: batch failed", zap.Error(r.err))
+			continue
+		}
+		for code, q := range r.quotes {
+			results[code] = q
+			p.cache.Set("quote:"+code, q, cacheTTL)
 		}
 	}
-	return quotes, errs
+
+	return results, errs
 }
 
-// InvalidateCache 主动清除某只股票的缓存（测试 / 强制刷新用）。
+// InvalidateCache 主动清除某只股票的缓存。
 func (p *MarketProvider) InvalidateCache(code string) {
 	p.cache.Delete("quote:" + code)
 }
@@ -187,21 +264,29 @@ func (p *MarketProvider) InvalidateCache(code string) {
 // 私有方法
 // ─────────────────────────────────────────────────────────────────
 
-// fetchFromEastMoney 向东方财富 API 发起 HTTP GET，解析并转换为 Quote。
-func (p *MarketProvider) fetchFromEastMoney(code string) (*Quote, error) {
-	secid := buildSecID(code)
-	url := buildURL(secid)
+// fetchBatch 用 ulist.np 批量拉取行情。
+// codes 已过滤空值，secids 由 buildSecID 拼接。
+func (p *MarketProvider) fetchBatch(codes []string) (map[string]*Quote, error) {
+	secids := make([]string, 0, len(codes))
+	for _, code := range codes {
+		secids = append(secids, buildSecID(code))
+	}
+
+	url := fmt.Sprintf(
+		"%s?fltt=2&invt=2&fields=%s&secids=%s&ut=%s",
+		emUlistNpURL, emUlistFields,
+		strings.Join(secids, ","), emUlistUt,
+	)
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	// 伪装成浏览器，避免被反爬
 	req.Header.Set("User-Agent",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
-			"AppleWebKit/537.36 (KHTML, like Gecko) "+
-			"Chrome/124.0.0.0 Safari/537.36")
+			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", "https://quote.eastmoney.com/")
+	req.Header.Set("Accept", "*/*")
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -210,7 +295,7 @@ func (p *MarketProvider) fetchFromEastMoney(code string) (*Quote, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected http status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -218,13 +303,39 @@ func (p *MarketProvider) fetchFromEastMoney(code string) (*Quote, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	return parseEMResponse(body, code)
+	return parseUlistNpResp(body)
 }
 
-// buildSecID 根据股票代码判断市场，生成东方财富的 secid 参数。
-//
-//   - 6 开头 → 沪市主板/科创板 → "1.600519"
-//   - 其余   → 深市主板/创业板 → "0.000858"
+// parseUlistNpResp 解析 ulist.np 响应，返回 map[code]*Quote。
+func parseUlistNpResp(body []byte) (map[string]*Quote, error) {
+	var raw ulistNpResp
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w | body: %s", err, truncate(body, 200))
+	}
+	if raw.RC != 0 {
+		return nil, fmt.Errorf("eastmoney rc=%d | body: %s", raw.RC, truncate(body, 200))
+	}
+	// 非交易时段 / 代码无效时 diff 为空，返回空 map（不报错，上层 quote=nil）
+	if raw.Data == nil || len(raw.Data.Diff) == 0 {
+		return map[string]*Quote{}, nil
+	}
+
+	results := make(map[string]*Quote, len(raw.Data.Diff))
+	for i := range raw.Data.Diff {
+		item := &raw.Data.Diff[i]
+		if item.F12 == "" {
+			continue
+		}
+		results[item.F12] = item.toQuote()
+	}
+	return results, nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 工具函数
+// ─────────────────────────────────────────────────────────────────
+
+// buildSecID 6 开头 → 沪市 "1.xxx"，其余 → 深市 "0.xxx"。
 func buildSecID(code string) string {
 	if strings.HasPrefix(code, "6") {
 		return "1." + code
@@ -232,113 +343,32 @@ func buildSecID(code string) string {
 	return "0." + code
 }
 
-// buildURL 拼接完整的东方财富请求 URL。
-func buildURL(secid string) string {
-	return fmt.Sprintf(
-		"%s?ut=%s&invt=2&fltt=2&fields=%s&secid=%s",
-		emBaseURL, emUt, emFields, secid,
-	)
-}
-
-// parseEMResponse 解析东方财富响应 JSON，转换为统一的 Quote 结构。
-func parseEMResponse(body []byte, code string) (*Quote, error) {
-	var raw emResponse
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
+// jnf (json.Number → float64) 将 json.Number 转为 float64，"-" 或空值返回 0。
+func jnf(n json.Number) float64 {
+	if n == "" || n == "-" {
+		return 0
 	}
-
-	d := raw.Data
-
-	closePrice := parseEMFloatOrZero(d.F60)
-
-	price, err := parseEMFloat(d.F43)
+	f, err := n.Float64()
 	if err != nil {
-		price = 0
+		return 0
 	}
-	if price == 0 && closePrice > 0 {
-		price = closePrice
-	}
-	if price == 0 {
-		return nil, fmt.Errorf("no usable price in response, body=%s", truncate(body, 200))
-	}
-
-	market := "SZ"
-	if strings.HasPrefix(code, "6") {
-		market = "SH"
-	}
-
-	quote := &Quote{
-		Code:        d.F57,
-		Name:        d.F58,
-		Market:      market,
-		Price:       price,
-		High:        parseEMFloatOrZero(d.F44),
-		Low:         parseEMFloatOrZero(d.F45),
-		Open:        parseEMFloatOrZero(d.F46),
-		Volume:      parseEMInt(d.F47),
-		Amount:      parseEMFloatOrZero(d.F48),
-		VolumeRatio: parseEMFloatOrZero(d.F50),
-		Close:       closePrice,
-		Turnover:    parseEMFloatOrZero(d.F168),
-		Change:      parseEMFloatOrZero(d.F169),
-		ChangeRate:  parseEMFloatOrZero(d.F170),
-		UpdatedAt:   time.Now(),
-		FromCache:   false,
-	}
-
-	return quote, nil
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 解析工具函数
-// ─────────────────────────────────────────────────────────────────
-
-// parseEMFloat 解析东方财富返回的数值字段。
-// fltt=2 模式下，数值以 JSON number 或 string("-") 返回。
-// 当字段为 "-" 时返回 error，调用方决定如何处理。
-func parseEMFloat(raw json.RawMessage) (float64, error) {
-	if len(raw) == 0 {
-		return 0, fmt.Errorf("empty field")
-	}
-	// 尝试直接解析 number
-	var f float64
-	if err := json.Unmarshal(raw, &f); err == nil {
-		return f, nil
-	}
-	// 尝试解析为字符串（"-" 或 "123.45"）
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, fmt.Errorf("cannot parse %s", raw)
-	}
-	if s == "-" || s == "" {
-		return 0, fmt.Errorf("field is dash (non-trading)")
-	}
-	return strconv.ParseFloat(s, 64)
-}
-
-// parseEMFloatOrZero 解析失败时返回 0（非核心字段使用）。
-func parseEMFloatOrZero(raw json.RawMessage) float64 {
-	f, _ := parseEMFloat(raw)
 	return f
 }
 
-// parseEMInt 解析成交量等整数字段，失败返回 0。
-func parseEMInt(raw json.RawMessage) int64 {
-	if len(raw) == 0 {
-		return 0
+// splitBatches 将 codes 切分为每批最多 size 个的二维切片。
+func splitBatches(codes []string, size int) [][]string {
+	var batches [][]string
+	for i := 0; i < len(codes); i += size {
+		end := i + size
+		if end > len(codes) {
+			end = len(codes)
+		}
+		batches = append(batches, codes[i:end])
 	}
-	var n int64
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return n
-	}
-	var f float64
-	if err := json.Unmarshal(raw, &f); err == nil {
-		return int64(f)
-	}
-	return 0
+	return batches
 }
 
-// truncate 截断 byte slice，用于日志输出，避免打印超长内容。
+// truncate 截断 byte slice，用于日志输出。
 func truncate(b []byte, n int) string {
 	if len(b) <= n {
 		return string(b)
