@@ -1,51 +1,51 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 )
 
 // ═══════════════════════════════════════════════════════════════
-// K 线数据结构
+// K 线服务 - 优化版
+//
+// 优化点：
+// 1. 使用统一的 EMHTTPClient，共享连接池
+// 2. 指数退避重试策略（最多 3 次）
+// 3. 统一的 Cookie 注入和请求头
 // ═══════════════════════════════════════════════════════════════
 
-// KLine 单根 K 线。
 type KLine struct {
 	Date   string  `json:"date"`
 	Open   float64 `json:"open"`
 	Close  float64 `json:"close"`
 	Low    float64 `json:"low"`
 	High   float64 `json:"high"`
-	Volume int64   `json:"volume"` // 成交量（手）
-	Amount float64 `json:"amount"` // 成交额（元）
+	Volume int64   `json:"volume"`
+	Amount float64 `json:"amount"`
 }
 
-// ToECharts 转换为 ECharts candlestick 格式：[open, close, low, high]
 func (k KLine) ToECharts() [4]float64 {
 	return [4]float64{k.Open, k.Close, k.Low, k.High}
 }
 
-// KLineResponse 是 GetKLine 的返回结构，包含前端可直接使用的预处理数据。
 type KLineResponse struct {
 	Code       string       `json:"code"`
 	Name       string       `json:"name"`
 	Period     string       `json:"period"`
 	KLines     []KLine      `json:"klines"`
-	Dates      []string     `json:"dates"`       // ECharts X 轴
-	OHLCData   [][4]float64 `json:"ohlc_data"`   // candlestick series.data
-	VolumeData [][]any      `json:"volume_data"` // bar series.data
+	Dates      []string     `json:"dates"`
+	OHLCData   [][4]float64 `json:"ohlc_data"`
+	VolumeData [][]any      `json:"volume_data"`
 }
-
-// ═══════════════════════════════════════════════════════════════
-// 东方财富历史 K 线 API
-// ═══════════════════════════════════════════════════════════════
 
 const (
 	emKLineURL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 	emKLineUt  = "fa5fd1943c7b386f172d6893dbfba10b"
+
+	// K 线接口可能返回大量数据，超时稍长
+	klineRequestTimeout = 20 * time.Second
 )
 
 type emKLineRaw struct {
@@ -58,12 +58,14 @@ type emKLineRaw struct {
 	Message string `json:"msg"`
 }
 
-// GetKLine 是 StockService 上的方法，获取日 K 线数据（最多 limit 根，前复权）。
+// ─────────────────────────────────────────────────────────────────
+// 公开方法
+// ─────────────────────────────────────────────────────────────────
+
 func (s *StockService) GetKLine(code string, limit int) (*KLineResponse, error) {
 	return s.GetKLineEndAt(code, time.Now(), limit)
 }
 
-// GetKLineEndAt 获取指定日期截止的日 K 线数据（前复权）。
 func (s *StockService) GetKLineEndAt(code string, end time.Time, limit int) (*KLineResponse, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 120
@@ -76,25 +78,14 @@ func (s *StockService) GetKLineEndAt(code string, end time.Time, limit int) (*KL
 		emKLineURL, emKLineUt, secid, endDateStr, limit,
 	)
 
-	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	// 使用统一的 HTTP 客户端，带自动重试
+	client := GetEMHTTPClient()
+	body, err := client.FetchBody(context.Background(), rawURL, &EMRequestOption{
+		Timeout:    klineRequestTimeout,
+		MaxRetries: 3,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("build kline request: %w", err)
-	}
-	req.Header.Set("User-Agent",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "+
-			"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://quote.eastmoney.com/")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("kline http get: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("kline read body: %w", err)
+		return nil, fmt.Errorf("kline fetch: %w", err)
 	}
 
 	result, err := parseKLineResponse(body, code)
@@ -102,18 +93,26 @@ func (s *StockService) GetKLineEndAt(code string, end time.Time, limit int) (*KL
 		return nil, err
 	}
 
-	s.log.Sugar().Debugw("kline fetched",
+	s.log.Sugar().Debugw("kline: fetched",
 		"code", code,
 		"bars", len(result.KLines),
 	)
 	return result, nil
 }
 
-// parseKLineResponse 解析原始响应并构建前端友好的格式。
+// ─────────────────────────────────────────────────────────────────
+// 解析逻辑
+// ─────────────────────────────────────────────────────────────────
+
 func parseKLineResponse(body []byte, code string) (*KLineResponse, error) {
 	var raw emKLineRaw
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("kline unmarshal: %w", err)
+		return nil, fmt.Errorf("kline unmarshal: %w (body: %s)", err, truncateBytes(body, 100))
+	}
+
+	// 检查 API 错误
+	if raw.Code != 0 && raw.Message != "" {
+		return nil, fmt.Errorf("eastmoney api error: code=%d, msg=%s", raw.Code, raw.Message)
 	}
 
 	d := raw.Data
@@ -123,7 +122,6 @@ func parseKLineResponse(body []byte, code string) (*KLineResponse, error) {
 	volumeData := make([][]any, 0, len(d.Klines))
 
 	for i, line := range d.Klines {
-		// 格式："日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手率"
 		var (
 			date                   string
 			open, close, high, low float64
@@ -153,6 +151,9 @@ func parseKLineResponse(body []byte, code string) (*KLineResponse, error) {
 	name := d.Name
 	if name == "" {
 		name = code
+	}
+	if name == "" {
+		name = d.Code
 	}
 
 	return &KLineResponse{

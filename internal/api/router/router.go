@@ -18,10 +18,14 @@ func New(cfg *config.Config, log *zap.Logger) (
 	*service.AuditService,
 	*service.MarketSentinelService,
 	*service.StockReportService,
+	*service.ValuationService,
 ) {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
+
+	// 全局 Cookie 初始化（所有东财请求依赖此 Cookie）
+	service.InitGlobalTokenManager(log)
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -43,6 +47,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 	tradeV2Repo         := repo.NewTradeLogV2Repo(db)
 	marketSentimentRepo := repo.NewMarketSentimentRepo(db)
 	stockReportRepo     := repo.NewStockReportRepo(db)
+	valuationRepo       := repo.NewValuationRepo(db)
 
 	// ── Service 层 ───────────────────────────────────────────────
 	stockSvc          := service.NewStockService(log)
@@ -58,6 +63,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 	auditSvc          := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
 	marketSentinelSvc := service.NewMarketSentinelService(marketSentimentRepo, log)
 	stockReportSvc    := service.NewStockReportService(stockReportRepo, aiSvc, log)
+	valuationSvc      := service.NewValuationService(valuationRepo, watchlistRepo, log)
 
 	// ── Handler 层 ───────────────────────────────────────────────
 	stockHandler          := handler.NewStockHandler(stockRepo, stockSvc, log)
@@ -72,6 +78,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 	reviewHandler         := handler.NewReviewHandler(auditSvc, log)
 	marketSentinelHandler := handler.NewMarketSentinelHandler(marketSentinelSvc, log)
 	stockReportHandler    := handler.NewStockReportHandler(stockReportSvc, log)
+	valuationHandler      := handler.NewValuationHandler(valuationSvc, log)
 	healthHandler         := handler.NewHealthHandler()
 
 	// ── 路由 ─────────────────────────────────────────────────────
@@ -89,6 +96,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 			stocks.GET("/:code/analysis", analysisHandler.GetAnalysis)
 			stocks.GET("/:code/money-flow", alertHandler.GetMoneyFlow)
 			stocks.POST("/:code/money-flow/refresh", alertHandler.RefreshMoneyFlow)
+			stocks.GET("/:code/valuation", valuationHandler.GetValuation)
 		}
 
 		watchlist := v1.Group("/watchlist")
@@ -105,7 +113,6 @@ func New(cfg *config.Config, log *zap.Logger) (
 			trades.GET("/:code", tradeHandler.ListByCode)
 		}
 
-		// 复盘系统
 		review := v1.Group("/review")
 		{
 			review.POST("/submit", reviewHandler.Submit)
@@ -118,19 +125,17 @@ func New(cfg *config.Config, log *zap.Logger) (
 
 		v1.Group("/stats").GET("/performance", tradeHandler.GetPerformance)
 
-		// 每日复盘简报（原有）
 		reports := v1.Group("/reports")
 		{
 			reports.GET("/daily", reportHandler.GetDailyReport)
 			reports.POST("/daily/generate", reportHandler.GenerateDailyReport)
 		}
 
-		// 研报情报站（新增）
 		intel := v1.Group("/reports/intel")
 		{
-			intel.GET("", stockReportHandler.List)              // 分页查询
-			intel.POST("/sync", stockReportHandler.Sync)        // 手动同步
-			intel.POST("/ai", stockReportHandler.ProcessAI)     // 手动触发 AI 摘要
+			intel.GET("", stockReportHandler.List)
+			intel.POST("/sync", stockReportHandler.Sync)
+			intel.POST("/ai", stockReportHandler.ProcessAI)
 		}
 
 		alerts := v1.Group("/alerts")
@@ -156,6 +161,9 @@ func New(cfg *config.Config, log *zap.Logger) (
 		market := v1.Group("/market")
 		{
 			market.GET("/summary", marketSentinelHandler.GetSummary)
+			market.GET("/valuation-summary", valuationHandler.GetSummary)
+			market.POST("/valuation-sync", valuationHandler.TriggerSync)
+			market.POST("/valuation-backfill", valuationHandler.BackfillHistory)
 		}
 
 		admin := v1.Group("/admin")
@@ -175,5 +183,5 @@ func New(cfg *config.Config, log *zap.Logger) (
 		}
 	}
 
-	return r, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc
+	return r, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc, valuationSvc
 }

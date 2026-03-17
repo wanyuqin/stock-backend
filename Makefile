@@ -27,3 +27,15 @@ docker-up:
 ## docker-down: 停止容器（保留数据卷）
 docker-down:
 	docker compose down
+
+
+# 自动执行最新的 SQL 迁移文件
+db-migrate:
+	@latest_sql=$$(ls -t docker/*.sql | head -1); \
+	if [ -z "$$latest_sql" ]; then echo "No SQL files found in docker/"; exit 1; fi; \
+	echo "Applying: $$latest_sql ..."; \
+	docker exec -i stock_db psql -U admin -d stock_system < $$latest_sql
+
+# 验证当前数据库表结构
+db-status:
+	docker exec -it stock_db psql -U admin -d stock_system -c "\dt"

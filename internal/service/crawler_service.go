@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"runtime"
 	"sort"
 	"strconv"
@@ -21,7 +19,12 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════
-// 常量
+// CrawlerService — 全市场行情同步（优化版）
+//
+// 优化点：
+// 1. 使用统一的 EMHTTPClient，共享连接池
+// 2. 并发解析，Worker Pool 模式
+// 3. 去重与幂等入库
 // ═══════════════════════════════════════════════════════════════
 
 const (
@@ -30,31 +33,25 @@ const (
 		"&fields=f2,f3,f5,f6,f8,f10,f12,f14,f62,f184" +
 		"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
 
-	crawlerPageSize    = 100
-	crawlerWorkers     = 10
-	crawlerHTTPTimeout = 30 * time.Second
-	crawlerPageDelay   = 150 * time.Millisecond
+	crawlerPageSize   = 100
+	crawlerWorkers    = 10
+	crawlerPageDelay  = 150 * time.Millisecond
+	crawlerReqTimeout = 30 * time.Second
 )
 
 // ═══════════════════════════════════════════════════════════════
 // SyncError — 可分类的同步错误
 // ═══════════════════════════════════════════════════════════════
 
-// SyncErrorKind 错误分类
 type SyncErrorKind string
 
 const (
-	// SyncErrNetwork 网络层错误（连接超时、DNS失败等）
-	SyncErrNetwork SyncErrorKind = "network"
-	// SyncErrEmptyData 接口正常响应但返回 0 条数据（非交易时段）
+	SyncErrNetwork   SyncErrorKind = "network"
 	SyncErrEmptyData SyncErrorKind = "empty_data"
-	// SyncErrAPI 接口返回了非 0 的 rc 错误码
-	SyncErrAPI SyncErrorKind = "api_error"
-	// SyncErrParse 数据解析失败
-	SyncErrParse SyncErrorKind = "parse_error"
+	SyncErrAPI       SyncErrorKind = "api_error"
+	SyncErrParse     SyncErrorKind = "parse_error"
 )
 
-// SyncError 包含分类信息的同步错误
 type SyncError struct {
 	Kind    SyncErrorKind
 	Message string
@@ -133,27 +130,23 @@ func parseDiff(raw json.RawMessage) ([]map[string]interface{}, error) {
 
 type CrawlerService struct {
 	snapshotRepo repo.SnapshotRepo
-	client       *http.Client
 	log          *zap.Logger
 }
 
 func NewCrawlerService(snapshotRepo repo.SnapshotRepo, log *zap.Logger) *CrawlerService {
 	return &CrawlerService{
 		snapshotRepo: snapshotRepo,
-		client:       &http.Client{Timeout: crawlerHTTPTimeout},
 		log:          log,
 	}
 }
 
 // SyncFullMarketData 分页拉取全市场行情 → 并发解析 → 去重 → 批量 Upsert。
-// 返回 (*SyncError) 类型错误，调用方可按 Kind 分类处理。
 func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 	start := time.Now()
 	s.log.Info("crawler: SyncFullMarketData started")
 
 	allItems, err := s.fetchAllPages(ctx)
 	if err != nil {
-		// fetchAllPages 内部已包装为 SyncError
 		return 0, err
 	}
 
@@ -199,7 +192,8 @@ func (s *CrawlerService) SyncFullMarketData(ctx context.Context) (int, error) {
 // ── 分页抓取 ──────────────────────────────────────────────────────
 
 func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interface{}, error) {
-	firstPage, total, err := s.fetchPage(1)
+	// 第 1 页
+	firstPage, total, err := s.fetchPage(ctx, 1)
 	if err != nil {
 		return nil, newSyncErr(SyncErrNetwork, "抓取第1页失败: "+err.Error(), err)
 	}
@@ -226,7 +220,7 @@ func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interf
 
 		time.Sleep(crawlerPageDelay)
 
-		items, _, err := s.fetchPage(page)
+		items, _, err := s.fetchPage(ctx, page)
 		if err != nil {
 			s.log.Warn("crawler: page failed, skip", zap.Int("page", page), zap.Error(err))
 			continue
@@ -240,29 +234,17 @@ func (s *CrawlerService) fetchAllPages(ctx context.Context) ([]map[string]interf
 	return allItems, nil
 }
 
-func (s *CrawlerService) fetchPage(page int) ([]map[string]interface{}, int, error) {
+func (s *CrawlerService) fetchPage(ctx context.Context, page int) ([]map[string]interface{}, int, error) {
 	url := fmt.Sprintf("%s&pn=%d&pz=%d", emFullMarketBaseURL, page, crawlerPageSize)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-	req.Header.Set("Referer", "https://finance.eastmoney.com/")
-
-	resp, err := s.client.Do(req)
+	// 使用统一的 HTTP 客户端
+	client := GetEMHTTPClient()
+	body, err := client.FetchBody(ctx, url, &EMRequestOption{
+		Timeout:    crawlerReqTimeout,
+		MaxRetries: 3,
+	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("http get page %d: %w", page, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("http status %d on page %d", resp.StatusCode, page)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read body page %d: %w", page, err)
 	}
 
 	var parsed emFullMarketResp
@@ -431,5 +413,32 @@ func safeFloatPtr(v interface{}) *float64 {
 		return &f
 	default:
 		return nil
+	}
+}
+
+func safeDecimal(v interface{}) decimal.Decimal {
+	if v == nil {
+		return decimal.Zero
+	}
+	switch val := v.(type) {
+	case float64:
+		return decimal.NewFromFloat(val)
+	case string:
+		if val == "-" || val == "" {
+			return decimal.Zero
+		}
+		d, err := decimal.NewFromString(val)
+		if err != nil {
+			return decimal.Zero
+		}
+		return d
+	case json.Number:
+		d, err := decimal.NewFromString(string(val))
+		if err != nil {
+			return decimal.Zero
+		}
+		return d
+	default:
+		return decimal.Zero
 	}
 }

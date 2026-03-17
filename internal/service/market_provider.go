@@ -1,10 +1,9 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -13,40 +12,38 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════
-// 接口说明（经实际抓包验证，2026-03）
+// MarketProvider — 实时行情服务（优化版）
 //
-// ❌ push2.eastmoney.com/api/qt/stock/get  → TCP RST，已全线不可用
-// ✅ push2.eastmoney.com/api/qt/ulist.np/get → 正常，支持批量 secids
+// 优化点：
+// 1. 使用统一的 EMHTTPClient，共享连接池
+// 2. 本地缓存（5s TTL）减少请求
+// 3. 批量查询，单次最多 50 只
 //
-// ulist.np 字段映射（fltt=2，数值直接为浮点，无需 ÷100）：
-//   f12 = 股票代码      f13 = 市场(1=SH, 0=SZ)   f14 = 股票名称
-//   f2  = 当前价        f3  = 涨跌幅(%)            f4  = 涨跌额
-//   f5  = 成交量(手)    f6  = 成交额(元)            f7  = 振幅(%)
-//   f8  = 换手率(%)     f9  = 市盈率               f10 = 量比
-//   f15 = 最高价        f16 = 最低价               f17 = 今开
-//   f18 = 昨收价        f20 = 总市值               f21 = 流通市值
-//   f23 = 市净率
+// ulist.np 字段映射（fltt=2）：
+//   f12=代码 f13=市场 f14=名称 f2=价格 f3=涨跌幅 f4=涨跌额
+//   f5=成交量 f6=成交额 f8=换手率 f10=量比
+//   f15=最高 f16=最低 f17=今开 f18=昨收 f20=总市值 f21=流通市值
 // ═══════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────────────────────────────
-// Quote — 统一行情结构（字段语义不变，底层接口已换）
+// Quote — 统一行情结构
 // ─────────────────────────────────────────────────────────────────
 
 type Quote struct {
 	Code        string    `json:"code"`
 	Name        string    `json:"name"`
-	Market      string    `json:"market"`       // "SH" | "SZ"
-	Price       float64   `json:"price"`        // 当前价
-	Open        float64   `json:"open"`         // 今开
-	Close       float64   `json:"close"`        // 昨收
-	High        float64   `json:"high"`         // 最高
-	Low         float64   `json:"low"`          // 最低
-	Volume      int64     `json:"volume"`       // 成交量（手）
-	Amount      float64   `json:"amount"`       // 成交额（元）
-	Change      float64   `json:"change"`       // 涨跌额
-	ChangeRate  float64   `json:"change_rate"`  // 涨跌幅（%）
-	Turnover    float64   `json:"turnover"`     // 换手率（%）
-	VolumeRatio float64   `json:"volume_ratio"` // 量比
+	Market      string    `json:"market"`
+	Price       float64   `json:"price"`
+	Open        float64   `json:"open"`
+	Close       float64   `json:"close"`
+	High        float64   `json:"high"`
+	Low         float64   `json:"low"`
+	Volume      int64     `json:"volume"`
+	Amount      float64   `json:"amount"`
+	Change      float64   `json:"change"`
+	ChangeRate  float64   `json:"change_rate"`
+	Turnover    float64   `json:"turnover"`
+	VolumeRatio float64   `json:"volume_ratio"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	FromCache   bool      `json:"from_cache"`
 }
@@ -56,48 +53,42 @@ type Quote struct {
 // ─────────────────────────────────────────────────────────────────
 
 type ulistNpResp struct {
-	RC   int    `json:"rc"` // 0 = 成功
+	RC   int    `json:"rc"`
 	Data *struct {
-		Total int            `json:"total"`
-		Diff  []ulistNpItem  `json:"diff"`
+		Total int           `json:"total"`
+		Diff  []ulistNpItem `json:"diff"`
 	} `json:"data"`
 }
 
-// ulistNpItem 用 json.Number 兼容数字和 "-"（非交易时段字段值为 "-"）。
 type ulistNpItem struct {
-	F12 string      `json:"f12"` // 股票代码
-	F13 int         `json:"f13"` // 市场：1=SH, 0=SZ
-	F14 string      `json:"f14"` // 股票名称
-	F2  json.Number `json:"f2"`  // 当前价
-	F3  json.Number `json:"f3"`  // 涨跌幅(%)
-	F4  json.Number `json:"f4"`  // 涨跌额
-	F5  json.Number `json:"f5"`  // 成交量(手)
-	F6  json.Number `json:"f6"`  // 成交额(元)
-	F8  json.Number `json:"f8"`  // 换手率(%)
-	F10 json.Number `json:"f10"` // 量比
-	F15 json.Number `json:"f15"` // 最高价
-	F16 json.Number `json:"f16"` // 最低价
-	F17 json.Number `json:"f17"` // 今开
-	F18 json.Number `json:"f18"` // 昨收
-	F20 json.Number `json:"f20"` // 总市值
-	F21 json.Number `json:"f21"` // 流通市值
+	F12 string      `json:"f12"`
+	F13 int         `json:"f13"`
+	F14 string      `json:"f14"`
+	F2  json.Number `json:"f2"`
+	F3  json.Number `json:"f3"`
+	F4  json.Number `json:"f4"`
+	F5  json.Number `json:"f5"`
+	F6  json.Number `json:"f6"`
+	F8  json.Number `json:"f8"`
+	F10 json.Number `json:"f10"`
+	F15 json.Number `json:"f15"`
+	F16 json.Number `json:"f16"`
+	F17 json.Number `json:"f17"`
+	F18 json.Number `json:"f18"`
+	F20 json.Number `json:"f20"`
+	F21 json.Number `json:"f21"`
 }
 
-// toQuote 将 ulistNpItem 转换为 Quote。
 func (item *ulistNpItem) toQuote() *Quote {
 	market := "SZ"
 	if item.F13 == 1 {
 		market = "SH"
 	}
-
 	price := jnf(item.F2)
 	closePrice := jnf(item.F18)
-
-	// 非交易时段 price=0，用昨收兜底
 	if price == 0 && closePrice > 0 {
 		price = closePrice
 	}
-
 	return &Quote{
 		Code:        item.F12,
 		Name:        item.F14,
@@ -125,62 +116,56 @@ func (item *ulistNpItem) toQuote() *Quote {
 const (
 	emUlistNpURL  = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 	emUlistUt     = "bd1d9ddb04089700cf9c27f6f7426281"
-	// 请求的字段列表（不含 f7/f9/f23，减小响应体积）
 	emUlistFields = "f12,f13,f14,f2,f3,f4,f5,f6,f8,f10,f15,f16,f17,f18,f20,f21"
 
-	cacheTTL    = 5 * time.Second
-	httpTimeout = 8 * time.Second
-
-	// 每批最多 50 只，避免 URL 过长
-	batchSize = 50
+	quoteCacheTTL = 5 * time.Second
+	quoteBatchSize = 50
 )
 
-// MarketProvider 封装行情抓取 + 内存缓存。
 type MarketProvider struct {
-	httpClient *http.Client
-	cache      *gocache.Cache
-	log        *zap.Logger
+	cache *gocache.Cache
+	log   *zap.Logger
 }
 
 func NewMarketProvider(log *zap.Logger) *MarketProvider {
-	return &MarketProvider{
-		httpClient: &http.Client{
-			Timeout: httpTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
-			},
-		},
-		cache: gocache.New(cacheTTL, 30*time.Second),
+	p := &MarketProvider{
+		cache: gocache.New(quoteCacheTTL, 30*time.Second),
 		log:   log,
 	}
+
+	// 预热 Cookie（使用全局 TokenManager）
+	go func() {
+		if globalTM != nil {
+			if _, err := globalTM.GetStockCookie(); err != nil {
+				log.Warn("market_provider: cookie pre-warm failed, will retry on first request", zap.Error(err))
+			} else {
+				log.Info("market_provider: cookie pre-warm succeeded")
+			}
+		}
+	}()
+
+	return p
 }
 
 // ─────────────────────────────────────────────────────────────────
 // 公开方法
 // ─────────────────────────────────────────────────────────────────
 
-// FetchRealtimeQuote 获取单只股票实时行情。
-// 5s 内相同 code 直接返回缓存，不发起 HTTP 请求。
 func (p *MarketProvider) FetchRealtimeQuote(code string) (*Quote, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return nil, fmt.Errorf("stock code is empty")
 	}
 
-	// 1. 查缓存
 	cacheKey := "quote:" + code
 	if cached, found := p.cache.Get(cacheKey); found {
 		q := cached.(*Quote)
-		cp := *q // 拷贝一份，避免 FromCache 污染缓存对象
+		cp := *q
 		cp.FromCache = true
-		p.log.Sugar().Debugw("cache hit", "code", code)
 		return &cp, nil
 	}
 
-	// 2. 缓存未命中，通过批量接口拉取（单只也用 ulist.np，保持一致）
-	results, err := p.fetchBatch([]string{code})
+	results, err := p.fetchBatch(context.Background(), []string{code})
 	if err != nil {
 		return nil, fmt.Errorf("FetchRealtimeQuote(%s): %w", code, err)
 	}
@@ -189,22 +174,16 @@ func (p *MarketProvider) FetchRealtimeQuote(code string) (*Quote, error) {
 		return nil, fmt.Errorf("FetchRealtimeQuote(%s): not found in response", code)
 	}
 
-	// 3. 写缓存
-	p.cache.Set(cacheKey, q, cacheTTL)
-	p.log.Sugar().Debugw("fetched",
-		"code", code, "price", q.Price, "change_rate", q.ChangeRate)
+	p.cache.Set(cacheKey, q, quoteCacheTTL)
+	p.log.Sugar().Debugw("fetched", "code", code, "price", q.Price)
 	return q, nil
 }
 
-// FetchMultipleQuotes 批量获取多只股票实时行情。
-// 先查内存缓存，剩余 miss 的按 batchSize 分批并发请求 ulist.np。
-// 返回 map[code]*Quote，失败的 code 不出现在结果中。
 func (p *MarketProvider) FetchMultipleQuotes(codes []string) (map[string]*Quote, []error) {
 	if len(codes) == 0 {
 		return map[string]*Quote{}, nil
 	}
 
-	// 1. 先走缓存
 	missing := make([]string, 0, len(codes))
 	results := make(map[string]*Quote, len(codes))
 	for _, code := range codes {
@@ -222,100 +201,63 @@ func (p *MarketProvider) FetchMultipleQuotes(codes []string) (map[string]*Quote,
 		return results, nil
 	}
 
-	// 2. 分批并发请求
-	type batchResult struct {
-		quotes map[string]*Quote
-		err    error
-	}
-
-	batches := splitBatches(missing, batchSize)
-	ch := make(chan batchResult, len(batches))
-
-	for _, batch := range batches {
-		go func(b []string) {
-			q, err := p.fetchBatch(b)
-			ch <- batchResult{quotes: q, err: err}
-		}(batch)
-	}
-
 	var errs []error
-	for range batches {
-		r := <-ch
-		if r.err != nil {
-			errs = append(errs, r.err)
-			p.log.Warn("FetchMultipleQuotes: batch failed", zap.Error(r.err))
+	ctx := context.Background()
+	for _, batch := range splitBatches(missing, quoteBatchSize) {
+		batchQuotes, err := p.fetchBatch(ctx, batch)
+		if err != nil {
+			errs = append(errs, err)
+			p.log.Warn("FetchMultipleQuotes: batch failed", zap.Error(err))
 			continue
 		}
-		for code, q := range r.quotes {
+		for code, q := range batchQuotes {
 			results[code] = q
-			p.cache.Set("quote:"+code, q, cacheTTL)
+			p.cache.Set("quote:"+code, q, quoteCacheTTL)
 		}
 	}
 
 	return results, errs
 }
 
-// InvalidateCache 主动清除某只股票的缓存。
 func (p *MarketProvider) InvalidateCache(code string) {
 	p.cache.Delete("quote:" + code)
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 私有方法
+// 内部方法
 // ─────────────────────────────────────────────────────────────────
 
-// fetchBatch 用 ulist.np 批量拉取行情。
-// codes 已过滤空值，secids 由 buildSecID 拼接。
-func (p *MarketProvider) fetchBatch(codes []string) (map[string]*Quote, error) {
+// fetchBatch 批量获取行情（使用统一 HTTP 客户端）
+func (p *MarketProvider) fetchBatch(ctx context.Context, codes []string) (map[string]*Quote, error) {
 	secids := make([]string, 0, len(codes))
 	for _, code := range codes {
 		secids = append(secids, buildSecID(code))
 	}
 
-	url := fmt.Sprintf(
+	rawURL := fmt.Sprintf(
 		"%s?fltt=2&invt=2&fields=%s&secids=%s&ut=%s",
 		emUlistNpURL, emUlistFields,
 		strings.Join(secids, ","), emUlistUt,
 	)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	// 使用统一的 HTTP 客户端
+	client := GetEMHTTPClient()
+	body, err := client.FetchBody(ctx, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("User-Agent",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
-			"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://quote.eastmoney.com/")
-	req.Header.Set("Accept", "*/*")
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http get: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected http status: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, err
 	}
 
 	return parseUlistNpResp(body)
 }
 
-// parseUlistNpResp 解析 ulist.np 响应，返回 map[code]*Quote。
 func parseUlistNpResp(body []byte) (map[string]*Quote, error) {
 	var raw ulistNpResp
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w | body: %s", err, truncate(body, 200))
+		return nil, fmt.Errorf("unmarshal: %w | body: %s", err, truncateBytes(body, 200))
 	}
 	if raw.RC != 0 {
-		return nil, fmt.Errorf("eastmoney rc=%d | body: %s", raw.RC, truncate(body, 200))
+		return nil, fmt.Errorf("eastmoney rc=%d | body: %s", raw.RC, truncateBytes(body, 200))
 	}
-	// 非交易时段 / 代码无效时 diff 为空，返回空 map（不报错，上层 quote=nil）
 	if raw.Data == nil || len(raw.Data.Diff) == 0 {
 		return map[string]*Quote{}, nil
 	}
@@ -335,7 +277,6 @@ func parseUlistNpResp(body []byte) (map[string]*Quote, error) {
 // 工具函数
 // ─────────────────────────────────────────────────────────────────
 
-// buildSecID 6 开头 → 沪市 "1.xxx"，其余 → 深市 "0.xxx"。
 func buildSecID(code string) string {
 	if strings.HasPrefix(code, "6") {
 		return "1." + code
@@ -343,7 +284,6 @@ func buildSecID(code string) string {
 	return "0." + code
 }
 
-// jnf (json.Number → float64) 将 json.Number 转为 float64，"-" 或空值返回 0。
 func jnf(n json.Number) float64 {
 	if n == "" || n == "-" {
 		return 0
@@ -355,7 +295,6 @@ func jnf(n json.Number) float64 {
 	return f
 }
 
-// splitBatches 将 codes 切分为每批最多 size 个的二维切片。
 func splitBatches(codes []string, size int) [][]string {
 	var batches [][]string
 	for i := 0; i < len(codes); i += size {
@@ -366,12 +305,4 @@ func splitBatches(codes []string, size int) [][]string {
 		batches = append(batches, codes[i:end])
 	}
 	return batches
-}
-
-// truncate 截断 byte slice，用于日志输出。
-func truncate(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "..."
 }

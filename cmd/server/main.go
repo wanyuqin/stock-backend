@@ -34,7 +34,8 @@ func main() {
 	}
 
 	// ── 4. 构建路由 ───────────────────────────────────────────────
-	ginEngine, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc := router.New(cfg, log)
+	ginEngine, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc, valuationSvc :=
+		router.New(cfg, log)
 
 	// ── 5. 启动后台服务 ───────────────────────────────────────────
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -51,6 +52,9 @@ func main() {
 
 	// 研报情报站（每 6h 同步 + 每 10min AI 摘要）
 	go runReportWorkers(bgCtx, stockReportSvc, log)
+
+	// 估值同步（每日 16:30 盘后）
+	go runDailyValuationSync(bgCtx, valuationSvc, log)
 
 	// ── 6. 启动 HTTP Server ───────────────────────────────────────
 	srv := &http.Server{

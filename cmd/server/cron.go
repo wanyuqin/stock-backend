@@ -14,7 +14,6 @@ import (
 // ─────────────────────────────────────────────────────────────────
 
 func runDailyPriceTracker(ctx context.Context, auditSvc *service.AuditService, log *zap.Logger) {
-	// 启动 5 分钟后先跑一次（补齐历史）
 	select {
 	case <-ctx.Done():
 		return
@@ -56,20 +55,13 @@ func runTracker(ctx context.Context, auditSvc *service.AuditService, log *zap.Lo
 // 研报情报站：采集 + AI 摘要定时任务
 // ─────────────────────────────────────────────────────────────────
 
-// runReportWorkers 启动两个定时循环：
-//   - 每 6 小时同步一次东方财富研报（同步最近 3 天）
-//   - 每 10 分钟处理一批 is_processed=false 的 AI 摘要
-//
-// 启动后 2 分钟先各跑一次，补齐历史数据。
 func runReportWorkers(ctx context.Context, reportSvc *service.StockReportService, log *zap.Logger) {
-	// 延迟 2 分钟首次执行，等待其他服务就绪
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(2 * time.Minute):
 	}
 
-	// 首次补跑
 	doSyncReports(ctx, reportSvc, log)
 	doAISummaries(ctx, reportSvc, log)
 
@@ -114,6 +106,47 @@ func doAISummaries(ctx context.Context, svc *service.StockReportService, log *za
 	if done > 0 {
 		log.Info("cron: AI summaries done", zap.Int("processed", done))
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 估值同步：每天 16:30（盘后）运行
+// ─────────────────────────────────────────────────────────────────
+
+// runDailyValuationSync 每天盘后 16:30 自动同步自选股估值。
+// 启动后 3 分钟先跑一次（补齐当日数据）。
+func runDailyValuationSync(ctx context.Context, valSvc *service.ValuationService, log *zap.Logger) {
+	// 延迟 3 分钟首次执行，等待其他服务就绪
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(3 * time.Minute):
+	}
+	doValuationSync(ctx, valSvc, log)
+
+	for {
+		next := nextTriggerTime(16, 30)
+		log.Sugar().Infof("valuation sync: next run at %s", next.Format("2006-01-02 15:04:05"))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Until(next)):
+			doValuationSync(ctx, valSvc, log)
+		}
+	}
+}
+
+func doValuationSync(ctx context.Context, svc *service.ValuationService, log *zap.Logger) {
+	log.Info("cron: valuation sync triggered")
+	result, err := svc.SyncWatchlistValuations(ctx, 1) // userID=1（单用户系统）
+	if err != nil {
+		log.Error("cron: valuation sync failed", zap.Error(err))
+		return
+	}
+	log.Info("cron: valuation sync done",
+		zap.Int("total", result.Total),
+		zap.Int("success", result.Success),
+		zap.Int("failed", result.Failed),
+	)
 }
 
 // ─────────────────────────────────────────────────────────────────

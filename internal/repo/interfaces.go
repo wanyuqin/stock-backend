@@ -79,26 +79,39 @@ type SnapshotRepo interface {
 // StockReportRepo 研报数据访问接口。
 // ─────────────────────────────────────────────────────────────────
 
-// StockReportQuery 分页查询参数。
 type StockReportQuery struct {
-	StockCode string // 可选，按代码筛选
-	Page      int    // 从 1 开始
-	Limit     int    // 每页条数，默认 20，最大 100
+	StockCode string
+	Page      int
+	Limit     int
 }
 
-// StockReportPage 分页查询结果。
 type StockReportPage struct {
-	Total int64                 `json:"total"`
-	Items []*model.StockReport  `json:"items"`
+	Total int64                `json:"total"`
+	Items []*model.StockReport `json:"items"`
 }
 
 type StockReportRepo interface {
-	// BulkUpsert 批量写入，info_code 冲突时忽略（幂等）
 	BulkUpsert(ctx context.Context, reports []*model.StockReport) (int64, error)
-	// ListPending 查询尚未处理 AI 摘要的记录
 	ListPending(ctx context.Context, limit int) ([]*model.StockReport, error)
-	// UpdateAISummary 更新 AI 摘要，标记已处理
 	UpdateAISummary(ctx context.Context, id int64, summary string) error
-	// List 分页查询（支持 stock_code 筛选）
 	List(ctx context.Context, q StockReportQuery) (*StockReportPage, error)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ValuationRepo 估值分位数据访问接口。
+// ─────────────────────────────────────────────────────────────────
+
+type ValuationRepo interface {
+	// UpsertSnapshot 写入/更新最新估值快照
+	UpsertSnapshot(ctx context.Context, v *model.StockValuation) error
+	// GetSnapshot 获取单只股票的最新估值
+	GetSnapshot(ctx context.Context, code string) (*model.StockValuation, error)
+	// ListSnapshots 批量获取（供 watchlist summary 用）
+	ListSnapshots(ctx context.Context, codes []string) ([]*model.StockValuation, error)
+	// InsertHistory 写入每日历史记录（ON CONFLICT DO NOTHING）
+	InsertHistory(ctx context.Context, h *model.StockValuationHistory) error
+	// ListHistory 获取指定股票的历史 PE/PB 序列（升序，供分位计算）
+	ListHistory(ctx context.Context, code string, limit int) ([]*model.StockValuationHistory, error)
+	// CountHistory 统计历史天数
+	CountHistory(ctx context.Context, code string) (int, error)
 }
