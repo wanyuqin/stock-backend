@@ -128,3 +128,19 @@ type ValuationRepo interface {
 	// CountHistory 统计历史天数
 	CountHistory(ctx context.Context, code string) (int, error)
 }
+
+// ─────────────────────────────────────────────────────────────────
+// BuyPlanRepo 买入计划数据访问接口。
+// ─────────────────────────────────────────────────────────────────
+
+type BuyPlanRepo interface {
+	Create(ctx context.Context, p *model.BuyPlan) error
+	Update(ctx context.Context, p *model.BuyPlan) error
+	GetByID(ctx context.Context, id int64) (*model.BuyPlan, error)
+	// ListByUser 查询用户计划，statuses 为空时返回全部状态
+	ListByUser(ctx context.Context, userID int64, statuses []model.BuyPlanStatus) ([]*model.BuyPlan, error)
+	ListByCode(ctx context.Context, userID int64, code string) ([]*model.BuyPlan, error)
+	UpdateStatus(ctx context.Context, id int64, status model.BuyPlanStatus) error
+	Delete(ctx context.Context, id int64) error
+	CountActive(ctx context.Context, userID int64) (int64, error)
+}

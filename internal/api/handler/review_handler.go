@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"stock-backend/internal/repo"
 	"stock-backend/internal/service"
 )
 
@@ -14,31 +15,20 @@ import (
 // ═══════════════════════════════════════════════════════════════
 
 type ReviewHandler struct {
-	auditSvc *service.AuditService
-	log      *zap.Logger
+	auditSvc        *service.AuditService
+	behaviorStatsRepo repo.BehaviorStatsRepo
+	log             *zap.Logger
 }
 
-func NewReviewHandler(auditSvc *service.AuditService, log *zap.Logger) *ReviewHandler {
-	return &ReviewHandler{auditSvc: auditSvc, log: log}
+func NewReviewHandler(auditSvc *service.AuditService, behaviorStatsRepo repo.BehaviorStatsRepo, log *zap.Logger) *ReviewHandler {
+	return &ReviewHandler{
+		auditSvc:          auditSvc,
+		behaviorStatsRepo: behaviorStatsRepo,
+		log:               log,
+	}
 }
 
-// ─────────────────────────────────────────────────────────────────
 // POST /api/v1/review/submit
-//
-// 用户提交复盘主观信息：情绪、标签、自我总结，可选触发 AI 审计。
-//
-// Body:
-//   {
-//     "trade_log_id": 42,
-//     "mental_state": "恐惧",
-//     "user_note":    "当时看到大盘跌了就慌了",
-//     "tags":         ["卖早了", "被情绪左右"],
-//     "buy_reason":   "均线多头排列，量能放大突破",
-//     "sell_reason":  "跌破5日线，止损",
-//     "trigger_ai":   true
-//   }
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) Submit(c *gin.Context) {
 	var req service.SubmitReviewRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -61,22 +51,10 @@ func (h *ReviewHandler) Submit(c *gin.Context) {
 	if req.TriggerAI {
 		aiMsg = "复盘已保存，AI 审计正在后台生成…"
 	}
-	OK(c, gin.H{
-		"review":  dto,
-		"message": aiMsg,
-	})
+	OK(c, gin.H{"review": dto, "message": aiMsg})
 }
 
-// ─────────────────────────────────────────────────────────────────
 // GET /api/v1/review/dashboard
-//
-// 返回复盘看板聚合数据：
-//   - 胜率 vs 逻辑一致率
-//   - 情绪热力图
-//   - 平均卖飞空间
-//   - 最近 5 条复盘
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) Dashboard(c *gin.Context) {
 	dto, err := h.auditSvc.GetDashboard(c.Request.Context(), defaultUserID)
 	if err != nil {
@@ -87,13 +65,7 @@ func (h *ReviewHandler) Dashboard(c *gin.Context) {
 	OK(c, dto)
 }
 
-// ─────────────────────────────────────────────────────────────────
 // GET /api/v1/review/list
-//
-// 查询全量复盘列表，支持分页。
-// Query: limit=20&offset=0
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) List(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
@@ -109,20 +81,10 @@ func (h *ReviewHandler) List(c *gin.Context) {
 	}
 	total, _ := h.auditSvc.CountReviews(c.Request.Context(), defaultUserID)
 
-	OK(c, gin.H{
-		"items":  items,
-		"total":  total,
-		"limit":  limit,
-		"offset": offset,
-	})
+	OK(c, gin.H{"items": items, "total": total, "limit": limit, "offset": offset})
 }
 
-// ─────────────────────────────────────────────────────────────────
 // POST /api/v1/review/ai/:id
-//
-// 手动触发单条复盘的 AI 审计（同步，等待返回）。
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) TriggerAI(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -137,7 +99,6 @@ func (h *ReviewHandler) TriggerAI(c *gin.Context) {
 		return
 	}
 
-	// 返回最新记录
 	items, _ := h.auditSvc.ListReviews(c.Request.Context(), defaultUserID, 100, 0)
 	for _, item := range items {
 		if item.ID == id {
@@ -148,12 +109,7 @@ func (h *ReviewHandler) TriggerAI(c *gin.Context) {
 	OK(c, gin.H{"message": "AI 审计完成"})
 }
 
-// ─────────────────────────────────────────────────────────────────
 // POST /api/v1/review/tracker/run
-//
-// 手动触发价格追踪器（正常由 Cron 调用，此接口供调试使用）。
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) RunTracker(c *gin.Context) {
 	count, err := h.auditSvc.RunPriceTracker(c.Request.Context())
 	if err != nil {
@@ -161,18 +117,10 @@ func (h *ReviewHandler) RunTracker(c *gin.Context) {
 		InternalError(c, err.Error())
 		return
 	}
-	OK(c, gin.H{
-		"updated": count,
-		"message": "价格追踪完成",
-	})
+	OK(c, gin.H{"updated": count, "message": "价格追踪完成"})
 }
 
-// ─────────────────────────────────────────────────────────────────
 // POST /api/v1/review/init
-//
-// 为最近 7 天的卖出记录批量初始化复盘草稿。
-// ─────────────────────────────────────────────────────────────────
-
 func (h *ReviewHandler) InitRecentSells(c *gin.Context) {
 	count, err := h.auditSvc.InitReviewsForRecentSells(c.Request.Context(), defaultUserID)
 	if err != nil {
@@ -180,8 +128,17 @@ func (h *ReviewHandler) InitRecentSells(c *gin.Context) {
 		InternalError(c, err.Error())
 		return
 	}
-	OK(c, gin.H{
-		"created": count,
-		"message": "复盘草稿初始化完成",
-	})
+	OK(c, gin.H{"created": count, "message": "复盘草稿初始化完成"})
+}
+
+// GET /api/v1/review/behavior-stats
+// 返回各类交易行为（PANIC_SELL / CHASING_HIGH 等）的次数、胜率、平均盈亏
+func (h *ReviewHandler) BehaviorStats(c *gin.Context) {
+	result, err := h.behaviorStatsRepo.GetBehaviorStats(c.Request.Context(), defaultUserID)
+	if err != nil {
+		h.log.Error("BehaviorStats failed", zap.Error(err))
+		InternalError(c, err.Error())
+		return
+	}
+	OK(c, result)
 }

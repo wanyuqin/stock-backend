@@ -16,47 +16,37 @@ import (
 )
 
 func main() {
-	// ── 1. 加载配置 ──────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		panic("failed to load config: " + err.Error())
 	}
 
-	// ── 2. 初始化 Logger ─────────────────────────────────────────
 	log := logger.New(cfg.AppEnv)
 	defer log.Sync() //nolint:errcheck
 
 	log.Sugar().Infow("config loaded", "env", cfg.AppEnv, "port", cfg.ServerPort)
 
-	// ── 3. 连接数据库 ─────────────────────────────────────────────
 	if _, err := data.InitDB(cfg, log); err != nil {
 		log.Sugar().Fatalw("failed to connect database", "err", err)
 	}
 
-	// ── 4. 构建路由 ───────────────────────────────────────────────
-	ginEngine, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc, valuationSvc :=
+	ginEngine, discoverySvc, auditSvc, marketSentinelSvc, stockReportSvc,
+		valuationSvc, morningBriefSvc, equitySvc, screenerTemplateSvc :=
 		router.New(cfg, log)
 
-	// ── 5. 启动后台服务 ───────────────────────────────────────────
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	defer bgCancel()
 
-	// 主力脉冲轮询
 	discoverySvc.Start(bgCtx)
-
-	// 全市场宏观监控
 	marketSentinelSvc.Start(bgCtx)
 
-	// 复盘价格追踪器（每日 16:05）
 	go runDailyPriceTracker(bgCtx, auditSvc, log)
-
-	// 研报情报站（每 6h 同步 + 每 10min AI 摘要）
 	go runReportWorkers(bgCtx, stockReportSvc, log)
-
-	// 估值同步（每日 16:30 盘后）
 	go runDailyValuationSync(bgCtx, valuationSvc, log)
+	go runMorningBriefWorker(bgCtx, morningBriefSvc, log)
+	go runDailyEquitySnapshot(bgCtx, equitySvc, log)
+	go runScreenerTemplatePush(bgCtx, screenerTemplateSvc, log)
 
-	// ── 6. 启动 HTTP Server ───────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + cfg.ServerPort,
 		Handler:      ginEngine,
@@ -72,13 +62,11 @@ func main() {
 		}
 	}()
 
-	// ── 7. 优雅关闭 ───────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Sugar().Info("shutting down server...")
-
 	discoverySvc.Stop()
 	bgCancel()
 

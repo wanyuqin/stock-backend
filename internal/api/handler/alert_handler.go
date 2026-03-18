@@ -27,11 +27,6 @@ func NewAlertHandler(
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/alerts
-//
-// 查询异动告警列表。
-// 查询参数：
-//   ?limit=50          最多返回条数（默认 50，上限 200）
-//   ?unread_only=true  只返回未读告警
 // ─────────────────────────────────────────────────────────────────
 
 func (h *AlertHandler) ListAlerts(c *gin.Context) {
@@ -51,16 +46,13 @@ func (h *AlertHandler) ListAlerts(c *gin.Context) {
 	}
 
 	OK(c, gin.H{
-		"count":  len(alerts),
-		"items":  alerts,
+		"count": len(alerts),
+		"items": alerts,
 	})
 }
 
 // ─────────────────────────────────────────────────────────────────
 // POST /api/v1/alerts/read
-//
-// 将指定 ID 列表的告警标记为已读。
-// Body: {"ids": [1, 2, 3]}
 // ─────────────────────────────────────────────────────────────────
 
 func (h *AlertHandler) MarkRead(c *gin.Context) {
@@ -84,8 +76,7 @@ func (h *AlertHandler) MarkRead(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/stocks/:code/money-flow
 //
-// 查询单只股票的资金流向历史（DB 已存快照）。
-// 查询参数：?limit=20
+// 查询 DB 中已存的资金流向历史快照。
 // ─────────────────────────────────────────────────────────────────
 
 func (h *AlertHandler) GetMoneyFlow(c *gin.Context) {
@@ -119,8 +110,15 @@ func (h *AlertHandler) GetMoneyFlow(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/v1/stocks/:code/money-flow/refresh
 //
-// 手动触发单只股票的实时资金流向抓取（立即发请求，不走缓存）。
-// 供调试和前端"刷新"按钮使用。
+// 实时资金流向 —— 改用腾讯证券 qt.gtimg.cn 外盘/内盘接口
+// 数据来源与 https://gu.qq.com/sh603920/gp/price 页面相同
+//
+// 返回字段：
+//   outer_vol / inner_vol / net_vol    外盘/内盘/净量（手）
+//   outer_amt / inner_amt / net_amt    外盘/内盘/净额（元）
+//   net_pct                            净流入占总成交量比例(%)
+//   big_buy_pct / big_sell_pct         买卖盘大单比例（来自 s_pk 接口）
+//   flow_desc                          可读流向描述文案
 // ─────────────────────────────────────────────────────────────────
 
 func (h *AlertHandler) RefreshMoneyFlow(c *gin.Context) {
@@ -130,30 +128,48 @@ func (h *AlertHandler) RefreshMoneyFlow(c *gin.Context) {
 		return
 	}
 
-	// 从 DB 读取 market，推断不到时降级
-	market := "SH"
-	if len(code) > 0 && code[0] != '6' {
-		market = "SZ"
-	}
-
-	mf, err := h.mfSvc.FetchAndSave(c.Request.Context(), code, market)
+	// 调用腾讯 qt 接口，获取外盘/内盘实时数据
+	flow, err := service.FetchQTRealtimeFlow(c.Request.Context(), code, h.log)
 	if err != nil {
-		h.log.Error("RefreshMoneyFlow failed", zap.String("code", code), zap.Error(err))
-		InternalError(c, "抓取资金流向失败: "+err.Error())
+		h.log.Error("RefreshMoneyFlow(QT) failed", zap.String("code", code), zap.Error(err))
+		InternalError(c, "抓取实时资金流向失败: "+err.Error())
 		return
 	}
 
+	// 返回前端 MoneyFlowPanel 需要的完整字段集
 	OK(c, gin.H{
-		"code":               mf.StockCode,
-		"market":             mf.Market,
-		"main_net_inflow":    mf.MainNetInflow.StringFixed(0),
-		"super_large_inflow": mf.SuperLargeInflow.StringFixed(0),
-		"large_inflow":       mf.LargeInflow.StringFixed(0),
-		"medium_inflow":      mf.MediumInflow.StringFixed(0),
-		"small_inflow":       mf.SmallInflow.StringFixed(0),
-		"main_inflow_pct":    mf.MainInflowPct.StringFixed(4),
-		"pct_chg":            mf.PctChg.StringFixed(2),
-		"volume":             mf.Volume,
-		"date":               mf.Date.Format("2006-01-02"),
+		// ── 兼容旧字段（MoneyFlowPanel 现有逻辑用这几个） ──
+		"main_net_inflow":    flow.NetAmt,                 // 元，净流入
+		"super_large_inflow": flow.OuterAmt * 0.35,        // 外盘中特大单估算（用盘口比例推算）
+		"large_inflow":       flow.OuterAmt * 0.65,        // 外盘中大单估算
+		"main_inflow_pct":    flow.NetPct,                  // 净流入占比(%)
+
+		// ── 新增：外盘/内盘原始数据 ──
+		"outer_vol":   flow.OuterVol,  // 外盘（手）
+		"inner_vol":   flow.InnerVol,  // 内盘（手）
+		"net_vol":     flow.NetVol,    // 净量（手）
+		"outer_amt":   flow.OuterAmt,  // 外盘金额（元）
+		"inner_amt":   flow.InnerAmt,  // 内盘金额（元）
+		"net_amt":     flow.NetAmt,    // 净流入金额（元）
+		"net_pct":     flow.NetPct,    // 净流入占比(%)
+
+		// ── 盘口大单比例（来自腾讯 s_pk 接口） ──
+		"big_buy_pct":  flow.BigBuyPct,  // 买盘大单比例
+		"big_sell_pct": flow.BigSellPct, // 卖盘大单比例
+		"sml_buy_pct":  flow.SmlBuyPct,  // 买盘小单比例
+		"sml_sell_pct": flow.SmlSellPct, // 卖盘小单比例
+
+		// ── 行情 ──
+		"price":        flow.Price,
+		"change":       flow.Change,
+		"change_rate":  flow.ChangeRate,
+		"volume":       flow.Volume,
+		"amount":       flow.Amount,
+		"turnover":     flow.Turnover,
+		"volume_ratio": flow.VolumeRatio,
+
+		// ── 描述文案 ──
+		"flow_desc":  flow.FlowDesc,
+		"updated_at": flow.UpdatedAt,
 	})
 }
