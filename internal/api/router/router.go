@@ -36,7 +36,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 
 	// ── Repo 层 ──────────────────────────────────────────────────
 	stockRepo           := repo.NewStockRepo(db)
-	watchlistRepo        := repo.NewWatchlistRepo(db)
+	watchlistRepo       := repo.NewWatchlistRepo(db)
 	tradeRepo           := repo.NewTradeLogRepo(db)
 	scanRepo            := repo.NewScanRepo(db)
 	mfRepo              := repo.NewMoneyFlowRepo(db)
@@ -48,9 +48,11 @@ func New(cfg *config.Config, log *zap.Logger) (
 	marketSentimentRepo := repo.NewMarketSentimentRepo(db)
 	stockReportRepo     := repo.NewStockReportRepo(db)
 	valuationRepo       := repo.NewValuationRepo(db)
+	sectorRepo          := repo.NewSectorRepo(db) // 板块映射缓存
 
 	// ── Service 层 ───────────────────────────────────────────────
 	stockSvc          := service.NewStockService(log)
+	bigDealSvc        := service.NewBigDealService(service.NewQQDadanFetcher(log), log)
 	aiSvc             := service.NewAIAnalysisService(log)
 	tradeSvc          := service.NewTradeService(tradeRepo, stockSvc, log)
 	scanSvc           := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
@@ -59,7 +61,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 	discoverySvc      := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
 	crawlerSvc        := service.NewCrawlerService(snapshotRepo, log)
 	screenerSvc       := service.NewScreenerService(snapshotRepo, log)
-	guardianSvc       := service.NewPositionGuardianService(positionRepo, stockSvc, aiSvc, log)
+	guardianSvc       := service.NewPositionGuardianService(positionRepo, sectorRepo, stockSvc, aiSvc, log)
 	auditSvc          := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
 	marketSentinelSvc := service.NewMarketSentinelService(marketSentimentRepo, log)
 	stockReportSvc    := service.NewStockReportService(stockReportRepo, aiSvc, log)
@@ -79,6 +81,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 	marketSentinelHandler := handler.NewMarketSentinelHandler(marketSentinelSvc, log)
 	stockReportHandler    := handler.NewStockReportHandler(stockReportSvc, log)
 	valuationHandler      := handler.NewValuationHandler(valuationSvc, log)
+	bigDealHandler        := handler.NewBigDealHandler(bigDealSvc, stockSvc, log)
 	healthHandler         := handler.NewHealthHandler()
 
 	// ── 路由 ─────────────────────────────────────────────────────
@@ -97,6 +100,7 @@ func New(cfg *config.Config, log *zap.Logger) (
 			stocks.GET("/:code/money-flow", alertHandler.GetMoneyFlow)
 			stocks.POST("/:code/money-flow/refresh", alertHandler.RefreshMoneyFlow)
 			stocks.GET("/:code/valuation", valuationHandler.GetValuation)
+			stocks.GET("/:code/big-deal", bigDealHandler.GetBigDeal)
 		}
 
 		watchlist := v1.Group("/watchlist")

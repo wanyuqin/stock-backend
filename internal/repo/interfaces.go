@@ -98,6 +98,19 @@ type StockReportRepo interface {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// SectorRepo 板块映射缓存数据访问接口。
+// ─────────────────────────────────────────────────────────────────
+
+type SectorRepo interface {
+	// GetRelation 查询个股所属主板块映射（若不存在返回 nil, nil）
+	GetRelation(ctx context.Context, stockCode string) (*model.StockSectorRelation, error)
+	// UpsertRelation 写入/更新个股-板块映射
+	UpsertRelation(ctx context.Context, rel *model.StockSectorRelation) error
+	// UpsertSector 写入/更新板块基础信息
+	UpsertSector(ctx context.Context, s *model.Sector) error
+}
+
+// ─────────────────────────────────────────────────────────────────
 // ValuationRepo 估值分位数据访问接口。
 // ─────────────────────────────────────────────────────────────────
 

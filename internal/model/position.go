@@ -53,6 +53,17 @@ type DiagnosticSnapshot struct {
 	Amplitude    float64  `json:"amplitude"`       // 今日振幅
 	CanDoT       bool     `json:"can_do_t"`
 	Reasons      []string `json:"reasons"`         // 决策依据列表
+
+	// 板块相关性（从 SectorInfo 填充）
+	SectorName      string  `json:"sector_name"`       // 所属板块名称
+	SectorSecID     string  `json:"sector_sec_id"`     // 板块代码，如 BK0726
+	Sector5DChange  float64 `json:"sector_5d_change"`  // 板块今日涨跌幅（%）
+	RelStrengthDiff float64 `json:"rel_strength_diff"` // RS = 个股涨跌幅 - 板块涨跌幅（%）
+	SectorWarning   string  `json:"sector_warning"`    // 板块偏离警告文案（空=正常）
+
+	// 压力位距离
+	MA20DistPct     float64 `json:"ma20_dist_pct"`     // 当前价距离MA20百分比（正=在MA20上方）
+	MA20PressureTip string  `json:"ma20_pressure_tip"` // 压力位提示文案
 }
 
 // PositionDiagnostic 诊断记录
