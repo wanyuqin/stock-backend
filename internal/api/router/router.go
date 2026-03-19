@@ -56,27 +56,29 @@ func New(cfg *config.Config, log *zap.Logger) (
 	screenerTemplateRepo := repo.NewScreenerTemplateRepo(db)
 
 	// ── Service ───────────────────────────────────────────────────
-	stockSvc             := service.NewStockService(log)
-	bigDealSvc           := service.NewBigDealService(service.NewQQDadanFetcher(log), log)
-	aiSvc                := service.NewAIAnalysisService(log)
-	buyPlanSvc           := service.NewBuyPlanService(buyPlanRepo, stockSvc, log)
-	tradeSvc             := service.NewTradeService(tradeRepo, stockSvc, log)
-	scanSvc              := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
-	reportSvc            := service.NewReportService(scanRepo, aiSvc, log)
-	mfSvc                := service.NewMoneyFlowService(mfRepo, stockRepo, log)
-	discoverySvc         := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
-	crawlerSvc           := service.NewCrawlerService(snapshotRepo, log)
-	screenerSvc          := service.NewScreenerService(snapshotRepo, log)
-	guardianSvc          := service.NewPositionGuardianService(positionRepo, sectorRepo, stockSvc, aiSvc, log)
-	auditSvc             := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
-	marketSentinelSvc    := service.NewMarketSentinelService(marketSentimentRepo, log)
-	stockReportSvc       := service.NewStockReportService(stockReportRepo, aiSvc, log)
-	valuationSvc         := service.NewValuationService(valuationRepo, watchlistRepo, log)
-	scoreSvc             := service.NewStockScoreService(guardianSvc, marketSentinelSvc, valuationRepo, watchlistRepo, stockSvc, log)
-	morningBriefSvc      := service.NewMorningBriefService(marketSentinelSvc, guardianSvc, stockReportSvc, valuationSvc, buyPlanRepo, watchlistRepo, aiSvc, log)
-	equitySvc            := service.NewEquityService(accountSnapshotRepo, tradeSvc, log)
-	sectorHeatmapSvc     := service.NewSectorHeatmapService(log)
-	screenerTemplateSvc  := service.NewScreenerTemplateService(screenerTemplateRepo, screenerSvc, log)
+	stockSvc            := service.NewStockService(log)
+	bigDealSvc          := service.NewBigDealService(service.NewQQDadanFetcher(log), log)
+	aiSvc               := service.NewAIAnalysisService(log)
+	buyPlanSvc          := service.NewBuyPlanService(buyPlanRepo, stockSvc, log)
+	tradeSvc            := service.NewTradeService(tradeRepo, stockSvc, log)
+	scanSvc             := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
+	reportSvc           := service.NewReportService(scanRepo, aiSvc, log)
+	mfSvc               := service.NewMoneyFlowService(mfRepo, stockRepo, log)
+	discoverySvc        := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
+	crawlerSvc          := service.NewCrawlerService(snapshotRepo, log)
+	screenerSvc         := service.NewScreenerService(snapshotRepo, log)
+	guardianSvc         := service.NewPositionGuardianService(positionRepo, sectorRepo, stockSvc, aiSvc, log)
+	auditSvc            := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
+	marketSentinelSvc   := service.NewMarketSentinelService(marketSentimentRepo, log)
+	stockReportSvc      := service.NewStockReportService(stockReportRepo, aiSvc, log)
+	valuationSvc        := service.NewValuationService(valuationRepo, watchlistRepo, log)
+	scoreSvc            := service.NewStockScoreService(guardianSvc, marketSentinelSvc, valuationRepo, watchlistRepo, stockSvc, log)
+	morningBriefSvc     := service.NewMorningBriefService(marketSentinelSvc, guardianSvc, stockReportSvc, valuationSvc, buyPlanRepo, watchlistRepo, aiSvc, log)
+	equitySvc           := service.NewEquityService(accountSnapshotRepo, tradeSvc, log)
+	sectorHeatmapSvc    := service.NewSectorHeatmapService(log)
+	screenerTemplateSvc := service.NewScreenerTemplateService(screenerTemplateRepo, screenerSvc, log)
+
+	buyPlanSvc.SetGuardianSvc(guardianSvc)
 
 	// ── Handler ───────────────────────────────────────────────────
 	stockHandler            := handler.NewStockHandler(stockRepo, stockSvc, log)
@@ -109,60 +111,65 @@ func New(cfg *config.Config, log *zap.Logger) (
 	{
 		stocks := v1.Group("/stocks")
 		{
-			stocks.GET("",                      stockHandler.List)
-			stocks.GET("/:code",                stockHandler.GetByCode)
-			stocks.GET("/:code/quote",          stockHandler.GetQuote)
-			stocks.GET("/:code/kline",          analysisHandler.GetKLine)
-			stocks.GET("/:code/minute",         analysisHandler.GetMinute)
-			stocks.GET("/:code/analysis",       analysisHandler.GetAnalysis)
-			stocks.GET("/:code/money-flow",     alertHandler.GetMoneyFlow)
+			stocks.GET("",                           stockHandler.List)
+			stocks.GET("/:code",                     stockHandler.GetByCode)
+			stocks.GET("/:code/quote",               stockHandler.GetQuote)
+			stocks.GET("/:code/kline",               analysisHandler.GetKLine)
+			stocks.GET("/:code/minute",              analysisHandler.GetMinute)
+			stocks.GET("/:code/analysis",            analysisHandler.GetAnalysis)
+			stocks.GET("/:code/money-flow",          alertHandler.GetMoneyFlow)
 			stocks.POST("/:code/money-flow/refresh", alertHandler.RefreshMoneyFlow)
-			stocks.GET("/:code/valuation",      valuationHandler.GetValuation)
-			stocks.GET("/:code/big-deal",       bigDealHandler.GetBigDeal)
-			stocks.GET("/:code/buy-plans",      buyPlanHandler.ListByCode)
-			stocks.GET("/:code/score",          scoreHandler.GetScore)
+			stocks.GET("/:code/valuation",           valuationHandler.GetValuation)
+			stocks.GET("/:code/big-deal",            bigDealHandler.GetBigDeal)
+			stocks.GET("/:code/buy-plans",           buyPlanHandler.ListByCode)
+			stocks.GET("/:code/score",               scoreHandler.GetScore)
 		}
 
 		watchlist := v1.Group("/watchlist")
 		{
-			watchlist.GET("",        watchlistHandler.List)
-			watchlist.POST("",       watchlistHandler.Add)
+			watchlist.GET("",          watchlistHandler.List)
+			watchlist.POST("",         watchlistHandler.Add)
 			watchlist.DELETE("/:code", watchlistHandler.Remove)
 		}
 
 		buyPlans := v1.Group("/buy-plans")
 		{
-			buyPlans.GET("",                  buyPlanHandler.List)
-			buyPlans.POST("",                 buyPlanHandler.Create)
-			buyPlans.PUT("/:id",              buyPlanHandler.Update)
-			buyPlans.PATCH("/:id/status",     buyPlanHandler.UpdateStatus)
-			buyPlans.DELETE("/:id",           buyPlanHandler.Delete)
-			buyPlans.POST("/check-triggers",  buyPlanHandler.CheckTriggers)
+			buyPlans.GET("",                 buyPlanHandler.List)
+			buyPlans.POST("",                buyPlanHandler.Create)
+			buyPlans.PUT("/:id",             buyPlanHandler.Update)
+			buyPlans.PATCH("/:id/status",    buyPlanHandler.UpdateStatus)
+			buyPlans.DELETE("/:id",          buyPlanHandler.Delete)
+			buyPlans.POST("/check-triggers", buyPlanHandler.CheckTriggers)
 		}
 
+		// ★ trades：新增 PUT /:id 和 DELETE /:id
+		// 注意：GET /:code 和 PUT|DELETE /:id 共用 /:param，Gin 会按注册顺序匹配
+		// 用独立前缀 /by-id/ 避免路径冲突
 		trades := v1.Group("/trades")
 		{
-			trades.GET("",       tradeHandler.ListAll)
-			trades.POST("",      tradeHandler.AddTrade)
-			trades.GET("/:code", tradeHandler.ListByCode)
+			trades.GET("",            tradeHandler.ListAll)
+			trades.POST("",           tradeHandler.AddTrade)
+			trades.PUT("/:id",        tradeHandler.UpdateTrade)
+			trades.DELETE("/:id",     tradeHandler.DeleteTrade)
+			trades.GET("/code/:code", tradeHandler.ListByCode)
 		}
 
 		review := v1.Group("/review")
 		{
-			review.POST("/submit",         reviewHandler.Submit)
-			review.GET("/dashboard",       reviewHandler.Dashboard)
-			review.GET("/list",            reviewHandler.List)
-			review.POST("/ai/:id",         reviewHandler.TriggerAI)
-			review.POST("/tracker/run",    reviewHandler.RunTracker)
-			review.POST("/init",           reviewHandler.InitRecentSells)
-			review.GET("/behavior-stats",  reviewHandler.BehaviorStats)
+			review.POST("/submit",        reviewHandler.Submit)
+			review.GET("/dashboard",      reviewHandler.Dashboard)
+			review.GET("/list",           reviewHandler.List)
+			review.POST("/ai/:id",        reviewHandler.TriggerAI)
+			review.POST("/tracker/run",   reviewHandler.RunTracker)
+			review.POST("/init",          reviewHandler.InitRecentSells)
+			review.GET("/behavior-stats", reviewHandler.BehaviorStats)
 		}
 
 		stats := v1.Group("/stats")
 		{
-			stats.GET("/performance",        tradeHandler.GetPerformance)
-			stats.GET("/equity-curve",       equityHandler.GetCurve)
-			stats.POST("/equity-snapshot",   equityHandler.TakeSnapshot)
+			stats.GET("/performance",      tradeHandler.GetPerformance)
+			stats.GET("/equity-curve",     equityHandler.GetCurve)
+			stats.POST("/equity-snapshot", equityHandler.TakeSnapshot)
 		}
 
 		reports := v1.Group("/reports")
@@ -173,25 +180,25 @@ func New(cfg *config.Config, log *zap.Logger) (
 
 		intel := v1.Group("/reports/intel")
 		{
-			intel.GET("",         stockReportHandler.List)
-			intel.POST("/sync",   stockReportHandler.Sync)
-			intel.POST("/ai",     stockReportHandler.ProcessAI)
+			intel.GET("",       stockReportHandler.List)
+			intel.POST("/sync", stockReportHandler.Sync)
+			intel.POST("/ai",   stockReportHandler.ProcessAI)
 		}
 
 		alerts := v1.Group("/alerts")
 		{
-			alerts.GET("",        alertHandler.ListAlerts)
-			alerts.POST("/read",  alertHandler.MarkRead)
+			alerts.GET("",       alertHandler.ListAlerts)
+			alerts.POST("/read", alertHandler.MarkRead)
 		}
 
 		screener := v1.Group("/screener")
 		{
-			screener.POST("/execute",        screenerHandler.Execute)
-			screener.POST("/sync",           screenerHandler.SyncMarketData)
-			screener.GET("/status",          screenerHandler.Status)
-			screener.GET("/templates",       screenerTemplateHandler.List)
-			screener.POST("/templates",      screenerTemplateHandler.Create)
-			screener.PUT("/templates/:id",   screenerTemplateHandler.Update)
+			screener.POST("/execute",         screenerHandler.Execute)
+			screener.POST("/sync",            screenerHandler.SyncMarketData)
+			screener.GET("/status",           screenerHandler.Status)
+			screener.GET("/templates",        screenerTemplateHandler.List)
+			screener.POST("/templates",       screenerTemplateHandler.Create)
+			screener.PUT("/templates/:id",    screenerTemplateHandler.Update)
 			screener.DELETE("/templates/:id", screenerTemplateHandler.Delete)
 		}
 
@@ -217,9 +224,9 @@ func New(cfg *config.Config, log *zap.Logger) (
 		{
 			scan := admin.Group("/scan")
 			{
-				scan.POST("/run",      scanHandler.RunScan)
-				scan.GET("/today",     scanHandler.ListTodayScans)
-				scan.GET("/history",   scanHandler.ListScansByDate)
+				scan.POST("/run",    scanHandler.RunScan)
+				scan.GET("/today",   scanHandler.ListTodayScans)
+				scan.GET("/history", scanHandler.ListScansByDate)
 			}
 		}
 	}

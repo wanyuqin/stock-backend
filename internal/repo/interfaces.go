@@ -25,6 +25,9 @@ type WatchlistRepo interface {
 // TradeLogRepo 交易日志数据访问接口。
 type TradeLogRepo interface {
 	Create(ctx context.Context, t *model.TradeLog) error
+	GetByID(ctx context.Context, id int64) (*model.TradeLog, error)
+	Update(ctx context.Context, t *model.TradeLog) error
+	Delete(ctx context.Context, userID, id int64) error
 	ListByUser(ctx context.Context, userID int64, limit, offset int) ([]*model.TradeLog, error)
 	ListByCode(ctx context.Context, userID int64, code string) ([]*model.TradeLog, error)
 	ListAllByUser(ctx context.Context, userID int64) ([]*model.TradeLog, error)
@@ -75,10 +78,7 @@ type SnapshotRepo interface {
 	CountByDate(ctx context.Context, date time.Time) (int64, error)
 }
 
-// ─────────────────────────────────────────────────────────────────
 // StockReportRepo 研报数据访问接口。
-// ─────────────────────────────────────────────────────────────────
-
 type StockReportQuery struct {
 	StockCode string
 	Page      int
@@ -97,47 +97,28 @@ type StockReportRepo interface {
 	List(ctx context.Context, q StockReportQuery) (*StockReportPage, error)
 }
 
-// ─────────────────────────────────────────────────────────────────
 // SectorRepo 板块映射缓存数据访问接口。
-// ─────────────────────────────────────────────────────────────────
-
 type SectorRepo interface {
-	// GetRelation 查询个股所属主板块映射（若不存在返回 nil, nil）
 	GetRelation(ctx context.Context, stockCode string) (*model.StockSectorRelation, error)
-	// UpsertRelation 写入/更新个股-板块映射
 	UpsertRelation(ctx context.Context, rel *model.StockSectorRelation) error
-	// UpsertSector 写入/更新板块基础信息
 	UpsertSector(ctx context.Context, s *model.Sector) error
 }
 
-// ─────────────────────────────────────────────────────────────────
 // ValuationRepo 估值分位数据访问接口。
-// ─────────────────────────────────────────────────────────────────
-
 type ValuationRepo interface {
-	// UpsertSnapshot 写入/更新最新估值快照
 	UpsertSnapshot(ctx context.Context, v *model.StockValuation) error
-	// GetSnapshot 获取单只股票的最新估值
 	GetSnapshot(ctx context.Context, code string) (*model.StockValuation, error)
-	// ListSnapshots 批量获取（供 watchlist summary 用）
 	ListSnapshots(ctx context.Context, codes []string) ([]*model.StockValuation, error)
-	// InsertHistory 写入每日历史记录（ON CONFLICT DO NOTHING）
 	InsertHistory(ctx context.Context, h *model.StockValuationHistory) error
-	// ListHistory 获取指定股票的历史 PE/PB 序列（升序，供分位计算）
 	ListHistory(ctx context.Context, code string, limit int) ([]*model.StockValuationHistory, error)
-	// CountHistory 统计历史天数
 	CountHistory(ctx context.Context, code string) (int, error)
 }
 
-// ─────────────────────────────────────────────────────────────────
 // BuyPlanRepo 买入计划数据访问接口。
-// ─────────────────────────────────────────────────────────────────
-
 type BuyPlanRepo interface {
 	Create(ctx context.Context, p *model.BuyPlan) error
 	Update(ctx context.Context, p *model.BuyPlan) error
 	GetByID(ctx context.Context, id int64) (*model.BuyPlan, error)
-	// ListByUser 查询用户计划，statuses 为空时返回全部状态
 	ListByUser(ctx context.Context, userID int64, statuses []model.BuyPlanStatus) ([]*model.BuyPlan, error)
 	ListByCode(ctx context.Context, userID int64, code string) ([]*model.BuyPlan, error)
 	UpdateStatus(ctx context.Context, id int64, status model.BuyPlanStatus) error

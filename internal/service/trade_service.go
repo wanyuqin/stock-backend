@@ -27,6 +27,14 @@ type AddTradeRequest struct {
 	Reason    string  `json:"reason"`
 }
 
+type UpdateTradeRequest struct {
+	Action   string  `json:"action"`
+	Price    float64 `json:"price"`
+	Volume   int64   `json:"volume"`
+	TradedAt string  `json:"traded_at"`
+	Reason   string  `json:"reason"`
+}
+
 type TradeLogDTO struct {
 	ID        int64   `json:"id"`
 	UserID    int64   `json:"user_id"`
@@ -112,7 +120,69 @@ func (s *TradeService) AddTradeLog(ctx context.Context, userID int64, req *AddTr
 }
 
 // ─────────────────────────────────────────────────────────────────
-// ListAll — GET /api/v1/trades  全量流水（traded_at 倒序，支持分页）
+// UpdateTradeLog — PUT /api/v1/trades/:id
+// ─────────────────────────────────────────────────────────────────
+
+func (s *TradeService) UpdateTradeLog(ctx context.Context, userID, id int64, req *UpdateTradeRequest) (*TradeLogDTO, error) {
+	t, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("交易记录不存在")
+	}
+	if t.UserID != userID {
+		return nil, fmt.Errorf("无权限操作此记录")
+	}
+
+	// 更新可修改的字段
+	if req.Action != "" {
+		action := strings.ToUpper(req.Action)
+		if action != "BUY" && action != "SELL" {
+			return nil, fmt.Errorf("action 只能是 BUY 或 SELL")
+		}
+		t.Action = model.TradeAction(action)
+	}
+	if req.Price > 0 {
+		if req.Price > 1_000_000 {
+			return nil, fmt.Errorf("price 超出合理范围")
+		}
+		t.Price = req.Price
+	}
+	if req.Volume > 0 {
+		if req.Volume > 10_000_000 {
+			return nil, fmt.Errorf("volume 超出合理范围")
+		}
+		t.Volume = req.Volume
+	}
+	if req.TradedAt != "" {
+		tradedAt, err := parseTradedAt(req.TradedAt)
+		if err != nil {
+			return nil, fmt.Errorf("traded_at 格式错误: %w", err)
+		}
+		t.TradedAt = tradedAt
+	}
+	// reason 允许改为空字符串
+	t.Reason = strings.TrimSpace(req.Reason)
+
+	if err := s.repo.Update(ctx, t); err != nil {
+		return nil, fmt.Errorf("更新交易记录失败: %w", err)
+	}
+	s.log.Sugar().Infow("trade log updated", "id", id, "user_id", userID)
+	return toDTO(t), nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DeleteTradeLog — DELETE /api/v1/trades/:id
+// ─────────────────────────────────────────────────────────────────
+
+func (s *TradeService) DeleteTradeLog(ctx context.Context, userID, id int64) error {
+	if err := s.repo.Delete(ctx, userID, id); err != nil {
+		return fmt.Errorf("删除交易记录失败: %w", err)
+	}
+	s.log.Sugar().Infow("trade log deleted", "id", id, "user_id", userID)
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ListAll — GET /api/v1/trades
 // ─────────────────────────────────────────────────────────────────
 
 func (s *TradeService) ListAll(ctx context.Context, userID int64, limit, offset int) ([]*TradeLogDTO, error) {

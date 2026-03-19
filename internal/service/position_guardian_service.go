@@ -34,28 +34,28 @@ const (
 	supportTolerance  = 0.005
 	sellTAboveDayAvg  = 0.01
 
-	// 板块背离度阈值
-	rsWeakThreshold     = 3.0 // RS < -3% 触发弱势标记
-	rsCriticalThreshold = 5.0 // RS < -5% 触发严重警告 + 信号升级
+	rsWeakThreshold     = 3.0
+	rsCriticalThreshold = 5.0
+
+	nearStopThreshold   = 0.02 // 距止损 < 2% 时发出警告
+	nearTargetThreshold = 0.03 // 距目标 < 3% 时发出提示
 )
 
 // ═══════════════════════════════════════════════════════════════
 // 对外响应结构
 // ═══════════════════════════════════════════════════════════════
 
-// PositionDiagnosisResult 单只持仓完整诊断结果
 type PositionDiagnosisResult struct {
 	StockCode       string                   `json:"stock_code"`
 	StockName       string                   `json:"stock_name"`
 	Signal          model.SignalType         `json:"signal"`
-	ActionDirective string                   `json:"action_directive"` // 仅 AI 分析后有值
+	ActionDirective string                   `json:"action_directive"`
 	Snapshot        model.DiagnosticSnapshot `json:"snapshot"`
-	SectorInfo      *SectorInfo              `json:"sector_info"`      // 板块实时强度对比
+	SectorInfo      *SectorInfo              `json:"sector_info"`
 	Position        *model.PositionDetail    `json:"position"`
 	UpdatedAt       time.Time                `json:"updated_at"`
 }
 
-// PositionAIResult AI 深度分析结果（单只）
 type PositionAIResult struct {
 	StockCode       string    `json:"stock_code"`
 	StockName       string    `json:"stock_name"`
@@ -93,7 +93,6 @@ func NewPositionGuardianService(
 
 // ─────────────────────────────────────────────────────────────────
 // DiagnoseAll — 并发量化指标刷新，不调用 AI
-// 用于定时轮询：并发抓取行情 + 并发获取板块信息 + 计算指标 + 输出信号
 // ─────────────────────────────────────────────────────────────────
 
 func (s *PositionGuardianService) DiagnoseAll(ctx context.Context) ([]*PositionDiagnosisResult, error) {
@@ -105,7 +104,7 @@ func (s *PositionGuardianService) DiagnoseAll(ctx context.Context) ([]*PositionD
 		return []*PositionDiagnosisResult{}, nil
 	}
 
-	// ── Step 1：并发获取所有持仓的实时行情 ──────────────────────────
+	// Step 1：并发获取实时行情
 	type quoteResult struct {
 		code  string
 		quote *Quote
@@ -118,58 +117,50 @@ func (s *PositionGuardianService) DiagnoseAll(ctx context.Context) ([]*PositionD
 			quoteCh <- quoteResult{code: code, quote: q, err: e}
 		}(pos.StockCode)
 	}
-
 	quotes := make(map[string]*Quote, len(positions))
 	for range positions {
 		r := <-quoteCh
 		if r.err != nil {
-			s.log.Warn("DiagnoseAll: get quote failed",
-				zap.String("code", r.code), zap.Error(r.err))
+			s.log.Warn("DiagnoseAll: get quote failed", zap.String("code", r.code), zap.Error(r.err))
 			continue
 		}
 		quotes[r.code] = r.quote
 	}
 
-	// ── Step 2：并发获取所有持仓的板块强度信息 ───────────────────────
+	// Step 2：并发获取板块信息
 	type sectorInput struct {
 		Code        string
 		ChangeToday float64
 	}
-	inputs := make([]sectorInput, 0, len(positions))
+	sectorBatch := make([]sectorInput, 0, len(positions))
 	for _, pos := range positions {
-		q, ok := quotes[pos.StockCode]
-		if !ok {
-			continue
+		if q, ok := quotes[pos.StockCode]; ok {
+			sectorBatch = append(sectorBatch, sectorInput{pos.StockCode, q.ChangeRate})
 		}
-		inputs = append(inputs, sectorInput{Code: pos.StockCode, ChangeToday: q.ChangeRate})
 	}
-
-	// FetchSectorInfoBatch 内部已使用 sync.WaitGroup 并发
-	sectorBatch := make([]struct {
+	// FetchSectorInfoBatch 接受 []struct{ Code string; ChangeToday float64 }
+	// 需要适配一下
+	sectorInputs := make([]struct {
 		Code        string
 		ChangeToday float64
-	}, len(inputs))
-	for i, inp := range inputs {
-		sectorBatch[i].Code = inp.Code
-		sectorBatch[i].ChangeToday = inp.ChangeToday
+	}, len(sectorBatch))
+	for i, b := range sectorBatch {
+		sectorInputs[i].Code = b.Code
+		sectorInputs[i].ChangeToday = b.ChangeToday
 	}
-	sectorInfoMap := s.sectorProvider.FetchSectorInfoBatch(ctx, sectorBatch)
+	sectorInfoMap := s.sectorProvider.FetchSectorInfoBatch(ctx, sectorInputs)
 
-	// ── Step 3：串行计算技术指标（K 线依赖顺序，I/O 已预热）──────────
+	// Step 3：计算技术指标
 	results := make([]*PositionDiagnosisResult, 0, len(positions))
 	for _, pos := range positions {
 		quote, ok := quotes[pos.StockCode]
 		if !ok {
 			continue
 		}
-		sectorInfo := sectorInfoMap[pos.StockCode] // 可为 nil，diagnoseOneNoAI 容错
-
-		res, err := s.diagnoseOneNoAI(ctx, pos, quote, sectorInfo)
-		if err != nil {
-			s.log.Warn("diagnose failed, skip",
-				zap.String("code", pos.StockCode),
-				zap.Error(err),
-			)
+		sectorInfo := sectorInfoMap[pos.StockCode]
+		res, diagErr := s.diagnoseOneNoAI(ctx, pos, quote, sectorInfo)
+		if diagErr != nil {
+			s.log.Warn("diagnose failed, skip", zap.String("code", pos.StockCode), zap.Error(diagErr))
 			continue
 		}
 		results = append(results, res)
@@ -178,8 +169,7 @@ func (s *PositionGuardianService) DiagnoseAll(ctx context.Context) ([]*PositionD
 }
 
 // ─────────────────────────────────────────────────────────────────
-// AnalyzeOne — 对单只持仓触发 AI 深度分析，消耗 token
-// 手动触发，不在定时轮询中调用
+// AnalyzeOne — 对单只持仓触发 AI 深度分析
 // ─────────────────────────────────────────────────────────────────
 
 func (s *PositionGuardianService) AnalyzeOne(ctx context.Context, stockCode string) (*PositionAIResult, error) {
@@ -188,28 +178,23 @@ func (s *PositionGuardianService) AnalyzeOne(ctx context.Context, stockCode stri
 		return nil, fmt.Errorf("position not found: %s", stockCode)
 	}
 
-	// 并发获取行情 + 板块信息
 	var (
-		quote      *Quote
-		sectorInfo *SectorInfo
-		quoteErr   error
-		wg         sync.WaitGroup
+		quote    *Quote
+		quoteErr error
+		wg       sync.WaitGroup
 	)
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		quote, quoteErr = s.stockSvc.GetRealtimeQuote(stockCode)
 	}()
 	wg.Wait()
-
 	if quoteErr != nil {
 		return nil, fmt.Errorf("get quote: %w", quoteErr)
 	}
 
-	// 获取板块信息（不阻塞主流程）
-	rs, rsErr := s.sectorProvider.GetRelativeStrength(ctx, stockCode, quote.ChangeRate)
-	if rsErr == nil && rs != nil {
+	var sectorInfo *SectorInfo
+	if rs, rsErr := s.sectorProvider.GetRelativeStrength(ctx, stockCode, quote.ChangeRate); rsErr == nil && rs != nil {
 		sectorInfo = BuildSectorInfo(rs)
 	}
 
@@ -224,32 +209,29 @@ func (s *PositionGuardianService) AnalyzeOne(ctx context.Context, stockCode stri
 
 	cost := pos.AvgCost.InexactFloat64()
 	price := quote.Price
-
 	atr := calcATRFromKLines(klines, atrPeriod)
 	ma20, ma20Slope := calcMA20WithSlope(klines)
 	support, resistance := calcSupportResistance(klines, maPeriod)
 	amplitude := calcAmplitude(klines)
-	hardStop := cost - atrStopMultiplier*atr
+	atrStop := cost - atrStopMultiplier*atr
+	pnlPct := (price*(1-feeSell) - cost) / cost
 
-	netSellPrice := price * (1 - feeSell)
-	pnlPct := (netSellPrice - cost) / cost
-
-	snapshot := buildSnapshot(price, cost, pnlPct, atr, ma20, ma20Slope,
-		support, resistance, hardStop, amplitude, sectorInfo)
+	snapshot := buildSnapshot(pos, price, cost, pnlPct, atr, ma20, ma20Slope,
+		support, resistance, atrStop, amplitude, sectorInfo)
 
 	signal, reasons := s.runDecisionMatrix(pos, quote, snapshot, sectorInfo)
 	snapshot.Reasons = reasons
 	snapshot.CanDoT = (signal == model.SignalBuyT || signal == model.SignalSellT)
+	enrichSnapshot(&snapshot, signal, pos)
 
 	directive := s.buildAIDirectiveWithQty(ctx, quote, snapshot, signal, pos.AvailableQty)
 
-	diag := &model.PositionDiagnostic{
+	_ = s.posRepo.SaveDiagnostic(ctx, &model.PositionDiagnostic{
 		StockCode:       stockCode,
 		SignalType:      signal,
 		ActionDirective: directive,
 		DataSnapshot:    snapshot,
-	}
-	_ = s.posRepo.SaveDiagnostic(ctx, diag)
+	})
 
 	return &PositionAIResult{
 		StockCode:       stockCode,
@@ -261,8 +243,16 @@ func (s *PositionGuardianService) AnalyzeOne(ctx context.Context, stockCode stri
 
 // ─────────────────────────────────────────────────────────────────
 // SyncPosition — 同步手动录入的持仓成本
-// 录入时同步触发板块映射缓存（异步，不阻塞响应）
 // ─────────────────────────────────────────────────────────────────
+
+type SyncPositionRequest struct {
+	StockCode    string  `json:"stock_code"    binding:"required"`
+	AvgCost      float64 `json:"avg_cost"      binding:"required,gt=0"`
+	Quantity     int     `json:"quantity"      binding:"required,gt=0"`
+	AvailableQty int     `json:"available_qty"`
+	BoughtAt     string  `json:"bought_at"`  // YYYY-MM-DD，留空=今天
+	BuyReason    string  `json:"buy_reason"` // 买入理由，可选
+}
 
 func (s *PositionGuardianService) SyncPosition(ctx context.Context, req *SyncPositionRequest) (*model.PositionDetail, error) {
 	if req.StockCode == "" {
@@ -281,9 +271,22 @@ func (s *PositionGuardianService) SyncPosition(ctx context.Context, req *SyncPos
 		AvgCost:      costDec,
 		Quantity:     req.Quantity,
 		AvailableQty: req.AvailableQty,
+		BuyReason:    req.BuyReason,
 	}
 
-	if atr, err := s.calcATR(req.StockCode); err == nil && atr > 0 {
+	// 买入时间：有传 → 解析，没传 → 今天
+	if req.BoughtAt != "" {
+		cst := time.FixedZone("CST", 8*3600)
+		if t, parseErr := time.ParseInLocation("2006-01-02", req.BoughtAt, cst); parseErr == nil {
+			pos.BoughtAt = &t
+		}
+	} else {
+		now := time.Now()
+		pos.BoughtAt = &now
+	}
+
+	// ATR 初始止损
+	if atr, atrErr := s.calcATR(req.StockCode); atrErr == nil && atr > 0 {
 		stop := req.AvgCost - atrStopMultiplier*atr
 		stopDec := decimal.NewFromFloat(stop)
 		pos.HardStopLoss = &stopDec
@@ -293,35 +296,50 @@ func (s *PositionGuardianService) SyncPosition(ctx context.Context, req *SyncPos
 		return nil, fmt.Errorf("upsert position: %w", err)
 	}
 
-	// 异步同步板块映射（首次录入触发，失败不影响主流程）
 	go func() {
-		if _, err := s.sectorProvider.SyncSectorMapping(context.Background(), req.StockCode); err != nil {
+		if _, sectorErr := s.sectorProvider.SyncSectorMapping(context.Background(), req.StockCode); sectorErr != nil {
 			s.log.Warn("SyncPosition: sector mapping async failed",
-				zap.String("code", req.StockCode), zap.Error(err))
+				zap.String("code", req.StockCode), zap.Error(sectorErr))
 		}
 	}()
 
 	return pos, nil
 }
 
-// SyncPositionRequest 录入持仓请求体
-type SyncPositionRequest struct {
-	StockCode    string  `json:"stock_code"    binding:"required"`
-	AvgCost      float64 `json:"avg_cost"      binding:"required,gt=0"`
-	Quantity     int     `json:"quantity"      binding:"required,gt=0"`
-	AvailableQty int     `json:"available_qty"`
+// ─────────────────────────────────────────────────────────────────
+// LinkPlanToPosition — 买入计划执行后，把计划的止损/目标/理由写入持仓
+// ─────────────────────────────────────────────────────────────────
+
+func (s *PositionGuardianService) LinkPlanToPosition(
+	ctx context.Context,
+	stockCode string,
+	planID int64,
+	planStopLoss *float64,
+	planTargetPrice *float64,
+	planBuyReason string,
+) error {
+	pos, err := s.posRepo.GetByCode(ctx, stockCode)
+	if err != nil {
+		s.log.Debug("LinkPlanToPosition: position not found, skip",
+			zap.String("code", stockCode), zap.Int64("plan_id", planID))
+		return nil
+	}
+	pos.LinkedPlanID = &planID
+	pos.PlanStopLoss = planStopLoss
+	pos.PlanTargetPrice = planTargetPrice
+	pos.PlanBuyReason = planBuyReason
+	return s.posRepo.Upsert(ctx, pos)
 }
 
 // ─────────────────────────────────────────────────────────────────
-// diagnoseOneNoAI — 纯量化诊断，不调 AI（内部使用）
-// 行情和板块信息由 DiagnoseAll 预先并发获取后传入
+// diagnoseOneNoAI — 纯量化诊断（内部）
 // ─────────────────────────────────────────────────────────────────
 
 func (s *PositionGuardianService) diagnoseOneNoAI(
 	ctx context.Context,
 	pos *model.PositionDetail,
 	quote *Quote,
-	sectorInfo *SectorInfo, // 可为 nil，容错降级
+	sectorInfo *SectorInfo,
 ) (*PositionDiagnosisResult, error) {
 	code := pos.StockCode
 
@@ -336,47 +354,131 @@ func (s *PositionGuardianService) diagnoseOneNoAI(
 
 	cost := pos.AvgCost.InexactFloat64()
 	price := quote.Price
-
 	atr := calcATRFromKLines(klines, atrPeriod)
 	ma20, ma20Slope := calcMA20WithSlope(klines)
 	support, resistance := calcSupportResistance(klines, maPeriod)
 	amplitude := calcAmplitude(klines)
-	hardStop := cost - atrStopMultiplier*atr
+	atrStop := cost - atrStopMultiplier*atr
+	pnlPct := (price*(1-feeSell) - cost) / cost
 
-	netSellPrice := price * (1 - feeSell)
-	pnlPct := (netSellPrice - cost) / cost
-
-	snapshot := buildSnapshot(price, cost, pnlPct, atr, ma20, ma20Slope,
-		support, resistance, hardStop, amplitude, sectorInfo)
+	snapshot := buildSnapshot(pos, price, cost, pnlPct, atr, ma20, ma20Slope,
+		support, resistance, atrStop, amplitude, sectorInfo)
 
 	signal, reasons := s.runDecisionMatrix(pos, quote, snapshot, sectorInfo)
 	snapshot.Reasons = reasons
 	snapshot.CanDoT = (signal == model.SignalBuyT || signal == model.SignalSellT)
+	enrichSnapshot(&snapshot, signal, pos)
 
-	// 更新 hard_stop_loss 到 DB
-	stopDec := decimal.NewFromFloat(hardStop)
+	// 更新 ATR 止损到 DB（仅更新 hard_stop_loss，不覆盖计划止损）
+	stopDec := decimal.NewFromFloat(atrStop)
 	pos.HardStopLoss = &stopDec
 	_ = s.posRepo.Upsert(ctx, pos)
 
 	return &PositionDiagnosisResult{
-		StockCode:       code,
-		StockName:       quote.Name,
-		Signal:          signal,
-		ActionDirective: "", // 空，节省 token，由前端手动触发 AnalyzeOne
-		Snapshot:        snapshot,
-		SectorInfo:      sectorInfo,
-		Position:        pos,
-		UpdatedAt:       time.Now(),
+		StockCode:  code,
+		StockName:  quote.Name,
+		Signal:     signal,
+		Snapshot:   snapshot,
+		SectorInfo: sectorInfo,
+		Position:   pos,
+		UpdatedAt:  time.Now(),
 	}, nil
 }
 
-// buildSnapshot 构建 DiagnosticSnapshot，从 SectorInfo 填充板块字段
+// ─────────────────────────────────────────────────────────────────
+// enrichSnapshot — 填充面向小白的辅助字段
+// ─────────────────────────────────────────────────────────────────
+
+func enrichSnapshot(snap *model.DiagnosticSnapshot, signal model.SignalType, pos *model.PositionDetail) {
+	snap.HoldDays = pos.HoldDays()
+	snap.BuyReason = pos.BuyReason
+	snap.PlanBuyReason = pos.PlanBuyReason
+	snap.PlanStopLoss = pos.PlanStopLoss
+	snap.PlanTargetPrice = pos.PlanTargetPrice
+
+	// 有效止损位（优先计划止损）
+	effectiveStop := snap.HardStopLoss
+	if pos.PlanStopLoss != nil {
+		effectiveStop = *pos.PlanStopLoss
+	}
+
+	// 距止损百分比
+	if snap.Price > 0 && effectiveStop > 0 {
+		snap.StopDistPct = (snap.Price - effectiveStop) / snap.Price * 100
+		snap.NearStopWarning = snap.StopDistPct >= 0 && snap.StopDistPct < nearStopThreshold*100
+	}
+
+	// 距目标价百分比
+	if pos.PlanTargetPrice != nil && *pos.PlanTargetPrice > 0 && snap.Price > 0 {
+		dist := (*pos.PlanTargetPrice - snap.Price) / snap.Price * 100
+		snap.TargetDistPct = &dist
+		snap.NearTargetNotice = dist >= 0 && dist < nearTargetThreshold*100
+	}
+
+	snap.SuggestQty = suggestQuantity(signal, pos.Quantity)
+	snap.ActionSummary = buildActionSummary(signal, snap, pos)
+}
+
+func suggestQuantity(signal model.SignalType, totalQty int) int {
+	switch signal {
+	case model.SignalStopLoss:
+		return totalQty
+	case model.SignalSell, model.SignalSellT, model.SignalBuyT:
+		return totalQty / 3
+	default:
+		return 0
+	}
+}
+
+func buildActionSummary(signal model.SignalType, snap *model.DiagnosticSnapshot, pos *model.PositionDetail) string {
+	if snap.NearTargetNotice && snap.TargetDistPct != nil {
+		return fmt.Sprintf("🎯 距目标价仅剩 %.1f%%，考虑分批止盈（先卖 %d 股）", *snap.TargetDistPct, snap.SuggestQty)
+	}
+
+	switch signal {
+	case model.SignalStopLoss:
+		return fmt.Sprintf("🛑 已触发止损，今日必须卖出全部 %d 股，不要犹豫", pos.Quantity)
+	case model.SignalSell:
+		if snap.NearStopWarning {
+			return fmt.Sprintf("⚠️ 接近止损位（距止损仅 %.1f%%），建议立即减仓 %d 股观察", snap.StopDistPct, snap.SuggestQty)
+		}
+		return fmt.Sprintf("⚠️ 建议先卖出 %d 股（约 1/3 仓位）观察，保留底仓", snap.SuggestQty)
+	case model.SignalSellT:
+		return fmt.Sprintf("📈 现价偏高，可以高抛 %d 股，等回落到 ¥%.2f 附近再买回", snap.SuggestQty, snap.Support)
+	case model.SignalBuyT:
+		stop := snap.HardStopLoss
+		if snap.PlanStopLoss != nil {
+			stop = *snap.PlanStopLoss
+		}
+		return fmt.Sprintf("📉 现价偏低靠近支撑位，可以低吸 %d 股做T，止损 ¥%.2f", snap.SuggestQty, stop)
+	default: // HOLD
+		if snap.NearStopWarning {
+			return fmt.Sprintf("⚠️ 接近止损位，距止损还有 %.1f%%，请密切关注", snap.StopDistPct)
+		}
+		if snap.HoldDays > 20 {
+			return fmt.Sprintf("✅ 继续持有，今天不操作（已持仓 %d 天）", snap.HoldDays)
+		}
+		return "✅ 继续持有，今天不操作"
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────
+// buildSnapshot
+// ─────────────────────────────────────────────────────────────────
+
 func buildSnapshot(
+	pos *model.PositionDetail,
 	price, cost, pnlPct float64,
 	atr, ma20, ma20Slope float64,
-	support, resistance, hardStop, amplitude float64,
+	support, resistance, atrStop, amplitude float64,
 	si *SectorInfo,
 ) model.DiagnosticSnapshot {
+	// 有效止损：优先用计划止损
+	hardStop := atrStop
+	if pos.PlanStopLoss != nil {
+		hardStop = *pos.PlanStopLoss
+	}
+
 	snap := model.DiagnosticSnapshot{
 		Price:           price,
 		AvgCost:         cost,
@@ -392,14 +494,12 @@ func buildSnapshot(
 		MA20PressureTip: buildMA20PressureTip(price, ma20, ma20Slope),
 	}
 
-	// 从 SectorInfo 填充板块相关字段
 	if si != nil {
 		snap.SectorName      = si.SectorName
 		snap.SectorSecID     = si.SectorCode
 		snap.RelStrengthDiff = si.RelativeStrength
 		snap.SectorWarning   = buildSectorWarningFromSectorInfo(si)
 	}
-
 	return snap
 }
 
@@ -407,33 +507,20 @@ func buildSnapshot(
 // 决策矩阵
 // ─────────────────────────────────────────────────────────────────
 
-// buildSectorWarningFromSectorInfo 从 SectorInfo 生成板块偏离警告文案
 func buildSectorWarningFromSectorInfo(si *SectorInfo) string {
 	if si == nil {
 		return ""
 	}
 	switch si.RSLevel {
 	case "critical":
-		return fmt.Sprintf("严重偏离，建议立即调仓！%s（板块%.1f%%，RS=%.1f%%）",
-			si.SectorName, si.SectorChangePercent, si.RelativeStrength)
+		return fmt.Sprintf("严重偏离！%s（板块%.1f%%，RS=%.1f%%）", si.SectorName, si.SectorChangePercent, si.RelativeStrength)
 	case "weak":
-		return fmt.Sprintf("偏弱于%s（板块%.1f%%，RS=%.1f%%）",
-			si.SectorName, si.SectorChangePercent, si.RelativeStrength)
+		return fmt.Sprintf("偏弱于%s（板块%.1f%%，RS=%.1f%%）", si.SectorName, si.SectorChangePercent, si.RelativeStrength)
 	case "strong":
-		return fmt.Sprintf("强于%s（板块%.1f%%，RS=+%.1f%%）",
-			si.SectorName, si.SectorChangePercent, si.RelativeStrength)
+		return fmt.Sprintf("强于%s（板块%.1f%%，RS=+%.1f%%）", si.SectorName, si.SectorChangePercent, si.RelativeStrength)
 	default:
 		return ""
 	}
-}
-
-// buildSectorWarning 兼容旧调用（RelativeStrength 结构体版本）
-func buildSectorWarning(rs *RelativeStrength) string {
-	if rs == nil || rs.SectorName == "" {
-		return ""
-	}
-	si := BuildSectorInfo(rs)
-	return buildSectorWarningFromSectorInfo(si)
 }
 
 func (s *PositionGuardianService) runDecisionMatrix(
@@ -447,15 +534,17 @@ func (s *PositionGuardianService) runDecisionMatrix(
 	price := snap.Price
 	cost := snap.AvgCost
 
-	// 优先级 0：板块严重背离预警（不直接改变信号，加入 reasons）
+	// 板块背离预警（加入 reasons，不直接改变信号）
 	if sectorInfo != nil && sectorInfo.RelativeStrength < -rsWeakThreshold {
 		label := sectorInfo.RSLabel
 		if sectorInfo.RelativeStrength < -rsCriticalThreshold {
-			// 触发止损时：标记"主力主动流出"；未触发时：标记"行业偏弱"
 			label = fmt.Sprintf("个股显著弱于行业，主力主动流出（RS=%.1f%%）", sectorInfo.RelativeStrength)
 		}
 		reasons = append(reasons, fmt.Sprintf("板块背离：%s | %s", sectorInfo.SectorName, label))
 	}
+
+	// 有效止损位（优先计划止损）
+	effectiveStop := snap.HardStopLoss
 
 	// 优先级 1：强制止损
 	if price < snap.Support*(1-supportTolerance) {
@@ -466,14 +555,18 @@ func (s *PositionGuardianService) runDecisionMatrix(
 		reasons = append(reasons, fmt.Sprintf("浮亏%.1f%%触发-8%%硬止损", snap.PnLPct*100))
 		return model.SignalStopLoss, reasons
 	}
-	if price < snap.HardStopLoss {
-		reasons = append(reasons, fmt.Sprintf("价格%.2f低于ATR止损位%.2f(cost-2×ATR)", price, snap.HardStopLoss))
+	if price < effectiveStop {
+		stopLabel := "ATR止损位"
+		if pos.PlanStopLoss != nil {
+			stopLabel = "你设定的计划止损位"
+		}
+		reasons = append(reasons, fmt.Sprintf("价格%.2f低于%s%.2f", price, stopLabel, effectiveStop))
 		return model.SignalStopLoss, reasons
 	}
 
 	inLoss := snap.PnLPct < 0
 
-	// 优先级 2：做 T 判定
+	// 优先级 2：做T判定
 	if snap.Amplitude >= tAmplitudeMin && pos.AvailableQty > 0 {
 		nearSupport := price <= snap.Support*(1+supportTolerance)
 		nearResistance := price >= snap.Resistance*(1-supportTolerance)
@@ -487,12 +580,10 @@ func (s *PositionGuardianService) runDecisionMatrix(
 			reasons = append(reasons, fmt.Sprintf("振幅%.1f%%达标，%s，建议高抛", snap.Amplitude*100, reason))
 			return model.SignalSellT, reasons
 		}
-
 		if nearSupport && !inLoss {
 			reasons = append(reasons, fmt.Sprintf("振幅%.1f%%达标，靠近支撑位%.2f，可低吸做T", snap.Amplitude*100, snap.Support))
 			return model.SignalBuyT, reasons
 		}
-
 		if inLoss {
 			reasons = append(reasons, fmt.Sprintf("当前亏损%.1f%%，禁止加仓，仅允许高抛减仓", snap.PnLPct*100))
 			if nearResistance {
@@ -501,31 +592,26 @@ func (s *PositionGuardianService) runDecisionMatrix(
 		}
 	}
 
-	// 优先级 3：板块严重背离 + 止损未触发 → 升级为 SELL
-	// 区分"行业整体重挫（RS > +3%）"和"个股主动流出（RS < -3%）"
-	if sectorInfo != nil {
-		rs := sectorInfo.RelativeStrength
-		if rs < -rsCriticalThreshold {
-			// RS < -5%：个股显著弱于行业，建议减仓
-			reasons = append(reasons, fmt.Sprintf(
-				"个股跑输%s %.1f%%（RS=%.1f%%），属于主力主动流出，信号升级为减仓",
-				sectorInfo.SectorName, -rs, rs))
-			return model.SignalSell, reasons
-		}
-		if rs > rsCriticalThreshold && snap.PnLPct < stopLossPct*0.5 {
-			// RS > +5% 但个股仍大幅亏损：行业整体重挫，个股相对抗跌，持有观望
-			reasons = append(reasons, fmt.Sprintf(
-				"行业整体重挫（板块%.1f%%），个股相对抗跌（RS=+%.1f%%），建议持有等待行业企稳",
-				sectorInfo.SectorChangePercent, rs))
-		}
+	// 优先级 3：板块严重背离 → SELL
+	if sectorInfo != nil && sectorInfo.RelativeStrength < -rsCriticalThreshold {
+		reasons = append(reasons, fmt.Sprintf(
+			"个股跑输%s %.1f%%（RS=%.1f%%），主力主动流出，信号升级为减仓",
+			sectorInfo.SectorName, -sectorInfo.RelativeStrength, sectorInfo.RelativeStrength))
+		return model.SignalSell, reasons
 	}
 
-	// 优先级 4：MA20 趋势判定
+	// 优先级 4：MA20 趋势
 	if snap.MA20Slope < 0 && price < snap.MA20 {
 		reasons = append(reasons, fmt.Sprintf("MA20趋势向下(斜率%.4f)，价格低于MA20(%.2f)，建议减仓观望", snap.MA20Slope, snap.MA20))
 		return model.SignalSell, reasons
 	}
 
+	// 买入逻辑自检
+	if warning := checkBuyReasonValidity(pos.EffectiveBuyReason(), snap); warning != "" {
+		reasons = append(reasons, warning)
+	}
+
+	// T+0 收益空间
 	netSellPrice := price * (1 - feeSell)
 	netBuyCost := cost * (1 + feeBuy)
 	tProfit := (netSellPrice - netBuyCost) / netBuyCost
@@ -538,6 +624,41 @@ func (s *PositionGuardianService) runDecisionMatrix(
 	return model.SignalHold, reasons
 }
 
+func checkBuyReasonValidity(reason string, snap model.DiagnosticSnapshot) string {
+	if reason == "" {
+		return ""
+	}
+	for _, kw := range []string{"均线", "MA20", "ma20", "MA5", "ma5", "金叉"} {
+		if strContains(reason, kw) {
+			if snap.MA20Slope < 0 && snap.Price < snap.MA20 {
+				return fmt.Sprintf("⚠️ 买入理由含「%s」，但当前 MA20 已转跌，买入逻辑可能失效", kw)
+			}
+			break
+		}
+	}
+	for _, kw := range []string{"支撑", "回踩", "底部"} {
+		if strContains(reason, kw) {
+			if snap.Price < snap.Support*(1-supportTolerance) {
+				return fmt.Sprintf("⚠️ 买入理由含「%s」，但价格已跌破支撑位，买入逻辑可能失效", kw)
+			}
+			break
+		}
+	}
+	return ""
+}
+
+func strContains(s, sub string) bool {
+	if len(sub) == 0 || len(s) < len(sub) {
+		return false
+	}
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 // ─────────────────────────────────────────────────────────────────
 // AI 行动指令生成
 // ─────────────────────────────────────────────────────────────────
@@ -548,29 +669,29 @@ const positionGuardianPrompt = `你是一位专业的A股短线交易员，擅�
 - 股票：%s（%s）
 - 持仓成本：%.2f 元，现价：%.2f 元
 - 盈亏：%+.1f%%（含万一免五手续费）
+- 持仓天数：%d 天
+- 买入理由：%s
 - 可用仓位：%d 股
 
 技术面数据：
 - MA20：%.2f（趋势：%s，斜率：%+.4f）
 - ATR(20)：%.3f（今日振幅：%.1f%%）
 - 支撑位：%.2f，压力位：%.2f
-- 硬止损位（cost-2×ATR）：%.2f
-- MA20 压力位提示：%s
+- 有效止损位：%.2f（%s）
+- 距止损还有：%.2f%%
 
 板块强度：%s
-
 量化决策：%s
 决策依据：%s
 
-请以专业交易员身份，基于以上量化结果给出明确的行动指令。
-
-要求：
-1. 明确说明是否执行做T（高抛/低吸），以及具体价位
-2. 明确止损位是否需要调整
-3. 若当前盈亏为负，必须包含"绝对禁止亏损加仓"的警告
-4. 若板块背离严重，必须点明是"主力主动流出"还是"行业整体重挫"
-5. 禁止模棱两可，必须有具体价格或百分比数字
-6. 可以用 Markdown 格式，使用加粗和列表增强可读性`
+请以专业交易员身份，基于以上量化结果给出明确的行动指令。要求：
+1. 用简单易懂的语言（避免过多专业术语）
+2. 明确说明是否执行做T，以及具体价位和数量
+3. 明确当前止损位，以及在什么情况下需要执行止损
+4. 若当前盈亏为负，必须包含"绝对禁止亏损加仓"的警告
+5. 若买入理由可能失效，必须点明
+6. 禁止模棱两可，必须有具体价格或百分比数字
+7. 可以用 Markdown 格式，使用加粗和列表增强可读性`
 
 func (s *PositionGuardianService) buildAIDirectiveWithQty(
 	ctx context.Context,
@@ -594,16 +715,31 @@ func (s *PositionGuardianService) buildAIDirectiveWithQty(
 			snap.SectorName, snap.Sector5DChange, snap.RelStrengthDiff, snap.SectorWarning)
 	}
 
+	stopLabel := "ATR 公式计算"
+	if snap.PlanStopLoss != nil {
+		stopLabel = "你在买入计划中设定"
+	}
+
+	buyReason := snap.PlanBuyReason
+	if buyReason == "" {
+		buyReason = snap.BuyReason
+	}
+	if buyReason == "" {
+		buyReason = "未填写"
+	}
+
 	prompt := fmt.Sprintf(positionGuardianPrompt,
 		quote.Name, quote.Code,
 		snap.AvgCost, snap.Price,
 		snap.PnLPct*100,
+		snap.HoldDays,
+		buyReason,
 		availableQty,
 		snap.MA20, trend, snap.MA20Slope,
 		snap.ATR, snap.Amplitude*100,
 		snap.Support, snap.Resistance,
-		snap.HardStopLoss,
-		snap.MA20PressureTip,
+		snap.HardStopLoss, stopLabel,
+		snap.StopDistPct,
 		sectorStr,
 		signal,
 		formatReasons(snap.Reasons),
@@ -611,22 +747,17 @@ func (s *PositionGuardianService) buildAIDirectiveWithQty(
 
 	report, err := s.aiSvc.callEino(ctx, prompt)
 	if err != nil {
-		s.log.Warn("AI directive failed, use rule directive",
-			zap.String("code", quote.Code),
-			zap.Error(err),
-		)
+		s.log.Warn("AI directive failed, use rule directive", zap.String("code", quote.Code), zap.Error(err))
 		return s.buildRuleDirective(quote, snap, signal)
 	}
 	return report
 }
 
-// buildRuleDirective 无 AI Key 时的规则模板指令
 func (s *PositionGuardianService) buildRuleDirective(quote *Quote, snap model.DiagnosticSnapshot, signal model.SignalType) string {
 	lossWarning := ""
 	if snap.PnLPct < 0 {
 		lossWarning = fmt.Sprintf("【⚠️ 亏损%.1f%% — 绝对禁止加仓！】", snap.PnLPct*100)
 	}
-
 	sectorNote := ""
 	if snap.SectorWarning != "" {
 		sectorNote = fmt.Sprintf("【板块信号：%s】", snap.SectorWarning)
@@ -634,20 +765,20 @@ func (s *PositionGuardianService) buildRuleDirective(quote *Quote, snap model.Di
 
 	switch signal {
 	case model.SignalStopLoss:
-		return fmt.Sprintf("%s%s【止损】现价%.2f已触发止损条件，立即执行全部卖出，止损位%.2f。",
-			lossWarning, sectorNote, snap.Price, snap.HardStopLoss)
+		return fmt.Sprintf("%s%s【止损】现价%.2f已触发止损，立即卖出全部%d股，止损位¥%.2f。",
+			lossWarning, sectorNote, snap.Price, snap.SuggestQty, snap.HardStopLoss)
 	case model.SignalSellT:
-		return fmt.Sprintf("%s%s【高抛T】现价%.2f靠近压力位%.2f，振幅%.1f%%，建议卖出1/3仓位做T，等待回落至支撑位%.2f再买回。",
-			lossWarning, sectorNote, snap.Price, snap.Resistance, snap.Amplitude*100, snap.Support)
+		return fmt.Sprintf("%s%s【高抛T】现价%.2f靠近压力位%.2f，振幅%.1f%%，建议卖出%d股，等回落至支撑位%.2f再买回。",
+			lossWarning, sectorNote, snap.Price, snap.Resistance, snap.Amplitude*100, snap.SuggestQty, snap.Support)
 	case model.SignalBuyT:
-		return fmt.Sprintf("%s【低吸T】现价%.2f靠近支撑位%.2f，振幅%.1f%%，建议买入做T，止损位%.2f，目标压力位%.2f。",
-			sectorNote, snap.Price, snap.Support, snap.Amplitude*100, snap.HardStopLoss, snap.Resistance)
+		return fmt.Sprintf("%s【低吸T】现价%.2f靠近支撑%.2f，振幅%.1f%%，建议买入%d股做T，止损¥%.2f，目标¥%.2f。",
+			sectorNote, snap.Price, snap.Support, snap.Amplitude*100, snap.SuggestQty, snap.HardStopLoss, snap.Resistance)
 	case model.SignalSell:
-		return fmt.Sprintf("%s%s【减仓】MA20趋势向下(%.2f)，价格低于均线，建议逢高减仓，严守止损%.2f。",
-			lossWarning, sectorNote, snap.MA20, snap.HardStopLoss)
+		return fmt.Sprintf("%s%s【减仓】建议先卖出%d股（约1/3仓位），MA20趋势向下，严守止损¥%.2f。",
+			lossWarning, sectorNote, snap.SuggestQty, snap.HardStopLoss)
 	default:
-		return fmt.Sprintf("%s%s【持有】现价%.2f，盈亏%.1f%%，继续持有，硬止损%.2f，压力位%.2f注意减仓。",
-			lossWarning, sectorNote, snap.Price, snap.PnLPct*100, snap.HardStopLoss, snap.Resistance)
+		return fmt.Sprintf("%s%s%s 止损¥%.2f，压力位¥%.2f注意减仓。",
+			lossWarning, sectorNote, snap.ActionSummary, snap.HardStopLoss, snap.Resistance)
 	}
 }
 
@@ -673,10 +804,8 @@ func calcATRFromKLines(klines []KLine, n int) float64 {
 	recent := klines[len(klines)-n:]
 	trSum := 0.0
 	for i := 1; i < len(recent); i++ {
-		high := recent[i].High
-		low := recent[i].Low
-		prevClose := recent[i-1].Close
-		tr := math.Max(high-low, math.Max(math.Abs(high-prevClose), math.Abs(low-prevClose)))
+		high, low, prev := recent[i].High, recent[i].Low, recent[i-1].Close
+		tr := math.Max(high-low, math.Max(math.Abs(high-prev), math.Abs(low-prev)))
 		trSum += tr
 	}
 	if len(recent) <= 1 {
@@ -696,7 +825,7 @@ func calcMA20WithSlope(klines []KLine) (ma20, slope float64) {
 	}
 	ma20 = sum / float64(maPeriod)
 
-	slopeWindow := 5
+	const slopeWindow = 5
 	if n < maPeriod+slopeWindow-1 {
 		return ma20, 0
 	}
@@ -734,8 +863,7 @@ func calcSupportResistance(klines []KLine, n int) (support, resistance float64) 
 		start = 0
 	}
 	recent := klines[start:end]
-	support = recent[0].Low
-	resistance = recent[0].High
+	support, resistance = recent[0].Low, recent[0].High
 	for _, k := range recent[1:] {
 		if k.Low < support {
 			support = k.Low
@@ -744,7 +872,7 @@ func calcSupportResistance(klines []KLine, n int) (support, resistance float64) 
 			resistance = k.High
 		}
 	}
-	return support, resistance
+	return
 }
 
 func calcAmplitude(klines []KLine) float64 {
@@ -758,8 +886,6 @@ func calcAmplitude(klines []KLine) float64 {
 	return (last.High - last.Low) / last.Close
 }
 
-// calcMA20DistPct 计算当前价格距 MA20 的百分比
-// 正值 = 价格在 MA20 上方；负值 = 价格在 MA20 下方（MA20 是压力位）
 func calcMA20DistPct(price, ma20 float64) float64 {
 	if ma20 == 0 {
 		return 0
@@ -767,7 +893,6 @@ func calcMA20DistPct(price, ma20 float64) float64 {
 	return (price - ma20) / ma20 * 100
 }
 
-// buildMA20PressureTip 生成 MA20 压力位提示文案
 func buildMA20PressureTip(price, ma20, ma20Slope float64) string {
 	if ma20 == 0 {
 		return ""

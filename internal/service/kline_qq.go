@@ -10,15 +10,16 @@ import (
 )
 
 // ═══════════════════════════════════════════════════════════════
-// kline_qq.go — 腾讯证券 K 线 & 分时数据
+// kline_qq.go — 腾讯证券分时数据
 //
 // 接口一：当日分时
 //   GET /appstock/app/minute/query?_var=min_data_{code}&code={code}&r={rand}
-//   每条格式: "HHMM 价格 累计量(手) 累计额(元)"
 //
 // 接口二：多日分时（近5个交易日）
 //   GET /appstock/app/day/query?_var=fdays_data_{code}&code={code}&r={rand}
-//   data[].date / data[].data / data[].prec(昨收)
+//
+// 注意：fetchQQHTTP / toQTCode / gbkToUTF8 定义在 market_provider.go
+//       腾讯接口返回 GBK 编码，需在解析前转为 UTF-8
 // ═══════════════════════════════════════════════════════════════
 
 const (
@@ -26,53 +27,49 @@ const (
 	qqDayURL    = "https://web.ifzq.gtimg.cn/appstock/app/day/query"
 )
 
-// ─────────────────────────────────────────────────────────────────
-// 公开类型
-// ─────────────────────────────────────────────────────────────────
-
 // MinuteBar 一根分时 bar
 type MinuteBar struct {
-	Time      string  `json:"time"`       // "09:30"
-	Price     float64 `json:"price"`      // 当前价
-	Volume    int64   `json:"volume"`     // 本分钟成交量（手，增量）
-	Amount    float64 `json:"amount"`     // 本分钟成交额（元，增量）
-	AvgPrice  float64 `json:"avg_price"`  // 均价
-	CumVolume int64   `json:"cum_volume"` // 累计成交量（手）
-	CumAmount float64 `json:"cum_amount"` // 累计成交额（元）
+	Time      string  `json:"time"`
+	Price     float64 `json:"price"`
+	Volume    int64   `json:"volume"`    // 本分钟增量（手）
+	Amount    float64 `json:"amount"`    // 本分钟增量（元）
+	AvgPrice  float64 `json:"avg_price"`
+	CumVolume int64   `json:"cum_volume"`
+	CumAmount float64 `json:"cum_amount"`
 }
 
 // MinuteResponse 分时数据响应
 type MinuteResponse struct {
 	Code     string      `json:"code"`
 	Name     string      `json:"name"`
-	Date     string      `json:"date"`      // "20260318"
-	PreClose float64     `json:"pre_close"` // 昨收价（画基准线用）
+	Date     string      `json:"date"`
+	PreClose float64     `json:"pre_close"`
 	Bars     []MinuteBar `json:"bars"`
-	// ECharts 快速访问字段
-	Times   []string  `json:"times"`   // ["09:30", "09:31", ...]
-	Prices  []float64 `json:"prices"`  // 每分钟价格
-	Volumes [][]any   `json:"volumes"` // [[i, vol, dir], ...]
-	Amounts []float64 `json:"amounts"` // 每分钟成交额（增量，元）
+	Times    []string    `json:"times"`
+	Prices   []float64   `json:"prices"`
+	Volumes  [][]any     `json:"volumes"`
+	Amounts  []float64   `json:"amounts"`
 }
 
 // ─────────────────────────────────────────────────────────────────
-// GetMinuteData 获取当日分时数据
+// 公开方法
 // ─────────────────────────────────────────────────────────────────
 
 func (s *StockService) GetMinuteData(code string) (*MinuteResponse, error) {
 	qtCode := toQTCode(code)
 	url := fmt.Sprintf("%s?_var=min_data_%s&code=%s&r=%s",
 		qqMinuteURL, qtCode, qtCode, randStr())
-
-	body, err := fetchQTRaw(context.Background(), url)
+	body, err := fetchQQHTTP(context.Background(), url)
 	if err != nil {
 		return nil, fmt.Errorf("GetMinuteData fetch: %w", err)
 	}
-
+	// GBK → UTF-8
+	if utf8, e := gbkToUTF8(body); e == nil {
+		body = utf8
+	}
 	return parseMinuteResponse(body, qtCode, code)
 }
 
-// GetDayMinuteData 获取多日分时数据（最近 days 个交易日，最多 5）
 func (s *StockService) GetDayMinuteData(code string, days int) ([]*MinuteResponse, error) {
 	if days <= 0 || days > 5 {
 		days = 5
@@ -80,22 +77,22 @@ func (s *StockService) GetDayMinuteData(code string, days int) ([]*MinuteRespons
 	qtCode := toQTCode(code)
 	url := fmt.Sprintf("%s?_var=fdays_data_%s&code=%s&r=%s",
 		qqDayURL, qtCode, qtCode, randStr())
-
-	body, err := fetchQTRaw(context.Background(), url)
+	body, err := fetchQQHTTP(context.Background(), url)
 	if err != nil {
 		return nil, fmt.Errorf("GetDayMinuteData fetch: %w", err)
 	}
-
+	if utf8, e := gbkToUTF8(body); e == nil {
+		body = utf8
+	}
 	return parseDayMinuteResponse(body, qtCode, code, days)
 }
 
-// GetKLineQQ 从腾讯多日分时接口合成日 K 线（OHLC 由分时推算，近 5 日）
+// GetKLineQQ 从腾讯多日分时接口合成日 K 线（近 5 日）
 func (s *StockService) GetKLineQQ(code string, limit int) (*KLineResponse, error) {
 	days := limit
 	if days > 5 {
 		days = 5
 	}
-
 	results, err := s.GetDayMinuteData(code, days)
 	if err != nil {
 		return nil, err
@@ -110,7 +107,6 @@ func (s *StockService) GetKLineQQ(code string, limit int) (*KLineResponse, error
 		if len(day.Bars) == 0 {
 			continue
 		}
-
 		open := day.Bars[0].Price
 		closeP := day.Bars[len(day.Bars)-1].Price
 		high, low := open, open
@@ -122,7 +118,6 @@ func (s *StockService) GetKLineQQ(code string, limit int) (*KLineResponse, error
 				low = b.Price
 			}
 		}
-
 		lastBar := day.Bars[len(day.Bars)-1]
 		dateStr := formatQQDate(day.Date)
 
@@ -133,7 +128,7 @@ func (s *StockService) GetKLineQQ(code string, limit int) (*KLineResponse, error
 			High:   high,
 			Low:    low,
 			Volume: lastBar.CumVolume,
-			Amount: lastBar.CumAmount / 10000, // 元 → 万元（与东财对齐）
+			Amount: lastBar.CumAmount / 10000,
 		}
 		klines = append(klines, k)
 		dates = append(dates, dateStr)
@@ -152,27 +147,22 @@ func (s *StockService) GetKLineQQ(code string, limit int) (*KLineResponse, error
 	if len(results) > 0 {
 		name = results[0].Name
 	}
-
 	return &KLineResponse{
-		Code:       code,
-		Name:       name,
-		Period:     "daily",
-		KLines:     klines,
-		Dates:      dates,
-		OHLCData:   ohlcData,
-		VolumeData: volumeData,
+		Code: code, Name: name, Period: "daily",
+		KLines: klines, Dates: dates,
+		OHLCData: ohlcData, VolumeData: volumeData,
 	}, nil
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 解析函数
+// 解析函数（body 已经是 UTF-8）
 // ─────────────────────────────────────────────────────────────────
 
 func parseMinuteResponse(body []byte, qtCode, code string) (*MinuteResponse, error) {
 	raw := string(body)
 	jsonStart := strings.Index(raw, "{")
 	if jsonStart < 0 {
-		return nil, fmt.Errorf("parseMinuteResponse: no JSON in response")
+		return nil, fmt.Errorf("parseMinuteResponse: no JSON")
 	}
 
 	var resp struct {
@@ -185,7 +175,7 @@ func parseMinuteResponse(body []byte, qtCode, code string) (*MinuteResponse, err
 
 	stockRaw, ok := resp.Data[qtCode]
 	if !ok {
-		return nil, fmt.Errorf("parseMinuteResponse: code %s not found", qtCode)
+		return nil, fmt.Errorf("parseMinuteResponse: %s not found", qtCode)
 	}
 
 	var stockData struct {
@@ -203,15 +193,9 @@ func parseMinuteResponse(body []byte, qtCode, code string) (*MinuteResponse, err
 	bars, times, prices, volumes, amounts := parseMinuteBars(stockData.Data.Data)
 
 	return &MinuteResponse{
-		Code:     code,
-		Name:     name,
-		Date:     stockData.Data.Date,
-		PreClose: preClose,
-		Bars:     bars,
-		Times:    times,
-		Prices:   prices,
-		Volumes:  volumes,
-		Amounts:  amounts,
+		Code: code, Name: name, Date: stockData.Data.Date,
+		PreClose: preClose, Bars: bars,
+		Times: times, Prices: prices, Volumes: volumes, Amounts: amounts,
 	}, nil
 }
 
@@ -249,7 +233,6 @@ func parseDayMinuteResponse(body []byte, qtCode, code string, days int) ([]*Minu
 
 	name, _ := extractQTNameAndPreClose(stockData.Qt, qtCode)
 
-	// 接口返回新→旧，截取并反转为旧→新
 	entries := stockData.Data
 	if days < len(entries) {
 		entries = entries[:days]
@@ -263,21 +246,14 @@ func parseDayMinuteResponse(body []byte, qtCode, code string, days int) ([]*Minu
 		preClose, _ := strconv.ParseFloat(entry.Prec, 64)
 		bars, times, prices, volumes, amounts := parseMinuteBars(entry.Data)
 		results = append(results, &MinuteResponse{
-			Code:     code,
-			Name:     name,
-			Date:     entry.Date,
-			PreClose: preClose,
-			Bars:     bars,
-			Times:    times,
-			Prices:   prices,
-			Volumes:  volumes,
-			Amounts:  amounts,
+			Code: code, Name: name, Date: entry.Date,
+			PreClose: preClose, Bars: bars,
+			Times: times, Prices: prices, Volumes: volumes, Amounts: amounts,
 		})
 	}
 	return results, nil
 }
 
-// parseMinuteBars 把 ["HHMM price cumVol cumAmt", ...] 解析为 MinuteBar 切片
 func parseMinuteBars(rawLines []string) (
 	bars []MinuteBar,
 	times []string,
@@ -309,20 +285,14 @@ func parseMinuteBars(rawLines []string) (
 		prevCumAmt = cumAmt
 
 		t := formatQQTime(parts[0])
-
 		avgPrice := 0.0
 		if cumVol > 0 {
 			avgPrice = cumAmt / float64(cumVol) / 100
 		}
 
 		bars = append(bars, MinuteBar{
-			Time:      t,
-			Price:     price,
-			Volume:    vol,
-			Amount:    amt,
-			AvgPrice:  avgPrice,
-			CumVolume: cumVol,
-			CumAmount: cumAmt,
+			Time: t, Price: price, Volume: vol, Amount: amt,
+			AvgPrice: avgPrice, CumVolume: cumVol, CumAmount: cumAmt,
 		})
 		times = append(times, t)
 		prices = append(prices, price)
@@ -337,7 +307,6 @@ func parseMinuteBars(rawLines []string) (
 	return
 }
 
-// extractQTNameAndPreClose 从 qt 字段提取股票名和昨收价
 func extractQTNameAndPreClose(qt map[string]json.RawMessage, qtCode string) (name string, preClose float64) {
 	if qt == nil {
 		return qtCode, 0
@@ -358,10 +327,6 @@ func extractQTNameAndPreClose(qt map[string]json.RawMessage, qtCode string) (nam
 	}
 	return
 }
-
-// ─────────────────────────────────────────────────────────────────
-// 工具函数
-// ─────────────────────────────────────────────────────────────────
 
 func formatQQTime(s string) string {
 	if len(s) == 4 {

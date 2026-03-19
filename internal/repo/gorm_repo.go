@@ -52,8 +52,6 @@ func (r *stockRepo) Upsert(ctx context.Context, s *model.Stock) error {
 	return nil
 }
 
-// UpdateMoneyFlow 更新 stocks.latest_money_flow（元）。
-// 参数用 float64：pgx 从 NUMERIC(15,2) Scan 返回字符串，GORM 只能自动转 float64。
 func (r *stockRepo) UpdateMoneyFlow(ctx context.Context, code string, inflow float64) error {
 	err := r.db.WithContext(ctx).
 		Model(&model.Stock{}).
@@ -117,6 +115,51 @@ func NewTradeLogRepo(db *gorm.DB) TradeLogRepo { return &tradeLogRepo{db: db} }
 func (r *tradeLogRepo) Create(ctx context.Context, t *model.TradeLog) error {
 	if err := r.db.WithContext(ctx).Create(t).Error; err != nil {
 		return fmt.Errorf("Create trade_log: %w", err)
+	}
+	return nil
+}
+
+func (r *tradeLogRepo) GetByID(ctx context.Context, id int64) (*model.TradeLog, error) {
+	var t model.TradeLog
+	err := r.db.WithContext(ctx).First(&t, id).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("trade_log %d not found", id)
+		}
+		return nil, fmt.Errorf("GetByID trade_log: %w", err)
+	}
+	return &t, nil
+}
+
+func (r *tradeLogRepo) Update(ctx context.Context, t *model.TradeLog) error {
+	result := r.db.WithContext(ctx).
+		Model(t).
+		Updates(map[string]any{
+			"stock_code": t.StockCode,
+			"action":     t.Action,
+			"price":      t.Price,
+			"volume":     t.Volume,
+			"traded_at":  t.TradedAt,
+			"reason":     t.Reason,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("Update trade_log: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("trade_log %d not found", t.ID)
+	}
+	return nil
+}
+
+func (r *tradeLogRepo) Delete(ctx context.Context, userID, id int64) error {
+	result := r.db.WithContext(ctx).
+		Where("id = ? AND user_id = ?", id, userID).
+		Delete(&model.TradeLog{})
+	if result.Error != nil {
+		return fmt.Errorf("Delete trade_log: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("trade_log %d not found or no permission", id)
 	}
 	return nil
 }

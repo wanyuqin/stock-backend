@@ -1,0 +1,8 @@
+		trades := v1.Group("/trades")
+		{
+			trades.GET("",        tradeHandler.ListAll)
+			trades.POST("",       tradeHandler.AddTrade)
+			trades.PUT("/:id",    tradeHandler.UpdateTrade)
+			trades.DELETE("/:id", tradeHandler.DeleteTrade)
+			trades.GET("/:code",  tradeHandler.ListByCode)
+		}

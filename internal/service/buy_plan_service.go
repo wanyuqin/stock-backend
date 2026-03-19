@@ -63,13 +63,19 @@ type UpdateBuyPlanRequest struct {
 // ═══════════════════════════════════════════════════════════════
 
 type BuyPlanService struct {
-	repo   repo.BuyPlanRepo
-	market *MarketProvider
-	log    *zap.Logger
+	repo        repo.BuyPlanRepo
+	market      *MarketProvider
+	guardianSvc *PositionGuardianService // 执行计划时自动关联持仓（延迟注入避免循环依赖）
+	log         *zap.Logger
 }
 
 func NewBuyPlanService(r repo.BuyPlanRepo, stockSvc *StockService, log *zap.Logger) *BuyPlanService {
 	return &BuyPlanService{repo: r, market: stockSvc.market, log: log}
+}
+
+// SetGuardianSvc 延迟注入持仓守护服务（在 router 里 new 完两个服务后调用）
+func (s *BuyPlanService) SetGuardianSvc(gs *PositionGuardianService) {
+	s.guardianSvc = gs
 }
 
 // Create — 创建买入计划
@@ -128,7 +134,7 @@ func (s *BuyPlanService) Create(ctx context.Context, userID int64, req *CreateBu
 	return s.enrichDTO(plan, nil), nil
 }
 
-// List — 列表，活跃计划附带实时行情
+// List — 列表
 func (s *BuyPlanService) List(ctx context.Context, userID int64, statusFilter string) ([]*BuyPlanDTO, error) {
 	var statuses []model.BuyPlanStatus
 	switch statusFilter {
@@ -189,7 +195,7 @@ func (s *BuyPlanService) ListByCode(ctx context.Context, userID int64, code stri
 	return dtos, nil
 }
 
-// Update — 更新买入计划字段
+// Update — 更新计划字段
 func (s *BuyPlanService) Update(ctx context.Context, userID int64, id int64, req *UpdateBuyPlanRequest) (*BuyPlanDTO, error) {
 	plan, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -239,9 +245,9 @@ func (s *BuyPlanService) Update(ctx context.Context, userID int64, id int64, req
 	return s.enrichDTO(plan, nil), nil
 }
 
-// NOTE: UpdateStatus 定义在 buy_plan_update_status.go，签名含可选 tradeLogID
+// NOTE: UpdateStatus 定义在 buy_plan_update_status.go
 
-// Delete — 删除买入计划
+// Delete — 删除计划
 func (s *BuyPlanService) Delete(ctx context.Context, userID, id int64) error {
 	plan, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -253,7 +259,7 @@ func (s *BuyPlanService) Delete(ctx context.Context, userID, id int64) error {
 	return s.repo.Delete(ctx, id)
 }
 
-// CheckTriggers — 扫描 WATCHING 计划，价格到达买入区间时升级为 READY
+// CheckTriggers — 扫描 WATCHING 计划，价格到达时升级为 READY
 func (s *BuyPlanService) CheckTriggers(ctx context.Context, userID int64) ([]*BuyPlanDTO, error) {
 	plans, err := s.repo.ListByUser(ctx, userID, []model.BuyPlanStatus{model.BuyPlanStatusWatching})
 	if err != nil {
