@@ -1,0 +1,6 @@
+package service
+
+import "context"
+
+// bgCtx 返回一个 Background context，供独立 section 接口使用
+func bgCtx() context.Context { return context.Background() }

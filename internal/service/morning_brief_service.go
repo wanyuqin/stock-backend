@@ -36,16 +36,18 @@ type MorningBriefDTO struct {
 }
 
 type MorningBriefService struct {
-	marketSvc     *MarketSentinelService
-	guardianSvc   *PositionGuardianService
-	reportSvc     *StockReportService
-	valSvc        *ValuationService
-	dividendSvc   *DividendCalendarService
-	newsAnalyzer  *NewsSentimentAnalyzer // ★ 新增
-	buyPlanRepo   repo.BuyPlanRepo
-	watchlistRepo repo.WatchlistRepo
-	aiSvc         *AIAnalysisService
-	log           *zap.Logger
+	marketSvc      *MarketSentinelService
+	guardianSvc    *PositionGuardianService
+	reportSvc      *StockReportService
+	valSvc         *ValuationService
+	dividendSvc    *DividendCalendarService
+	newsAnalyzer   *NewsSentimentAnalyzer
+	interactiveSvc *InteractivePlatformService // ★ 互动易/巨潮公告
+	stockSvc       *StockService
+	buyPlanRepo    repo.BuyPlanRepo
+	watchlistRepo  repo.WatchlistRepo
+	aiSvc          *AIAnalysisService
+	log            *zap.Logger
 
 	mu         sync.RWMutex
 	cachedDate string
@@ -57,22 +59,26 @@ func NewMorningBriefService(
 	guardianSvc *PositionGuardianService,
 	reportSvc *StockReportService,
 	valSvc *ValuationService,
+	stockSvc *StockService,
 	buyPlanRepo repo.BuyPlanRepo,
 	watchlistRepo repo.WatchlistRepo,
 	aiSvc *AIAnalysisService,
+	interactiveSvc *InteractivePlatformService,
 	log *zap.Logger,
 ) *MorningBriefService {
 	return &MorningBriefService{
-		marketSvc:     marketSvc,
-		guardianSvc:   guardianSvc,
-		reportSvc:     reportSvc,
-		valSvc:        valSvc,
-		dividendSvc:   NewDividendCalendarService(log),
-		newsAnalyzer:  NewNewsSentimentAnalyzer(aiSvc, buyPlanRepo, guardianSvc.posRepo, log),
-		buyPlanRepo:   buyPlanRepo,
-		watchlistRepo: watchlistRepo,
-		aiSvc:         aiSvc,
-		log:           log,
+		marketSvc:      marketSvc,
+		guardianSvc:    guardianSvc,
+		reportSvc:      reportSvc,
+		valSvc:         valSvc,
+		stockSvc:       stockSvc,
+		dividendSvc:    NewDividendCalendarService(log),
+		newsAnalyzer:   NewNewsSentimentAnalyzer(aiSvc, buyPlanRepo, guardianSvc.posRepo, log),
+		interactiveSvc: interactiveSvc,
+		buyPlanRepo:    buyPlanRepo,
+		watchlistRepo:  watchlistRepo,
+		aiSvc:          aiSvc,
+		log:            log,
 	}
 }
 
@@ -124,7 +130,7 @@ func (s *MorningBriefService) generateAICommentAsync(brief *MorningBriefDTO) {
 	defer s.mu.Unlock()
 	if s.cachedDate == brief.Date && s.cached != nil {
 		s.cached.AIComment = comment
-		s.cached.AIPending  = false
+		s.cached.AIPending = false
 		s.log.Info("morning brief: AI comment updated in cache", zap.String("date", brief.Date))
 	}
 }
@@ -137,13 +143,13 @@ func (s *MorningBriefService) build(ctx context.Context, userID int64, today str
 	brief := &MorningBriefDTO{
 		Date:        today,
 		GeneratedAt: time.Now(),
-		Sections:    make([]MorningBriefSection, 6), // 6 个 section
+		Sections:    make([]MorningBriefSection, 7), // 7 个 section
 		AIPending:   s.aiSvc.apiKey != "",
 	}
 
 	marketSection, mood, score, moodSummary := s.buildMarketSection(ctx)
-	brief.MarketMood  = mood
-	brief.MoodScore   = score
+	brief.MarketMood = mood
+	brief.MoodScore = score
 	brief.MoodSummary = moodSummary
 	brief.Sections[0] = marketSection
 
@@ -158,8 +164,9 @@ func (s *MorningBriefService) build(ctx context.Context, userID int64, today str
 	go func() { ch <- result{s.buildReportSection(ctx), 3} }()
 	go func() { ch <- result{s.buildValuationSection(ctx, userID), 4} }()
 	go func() { ch <- result{s.buildNewsSection(ctx, userID), 5} }() // ★ 新闻情绪
+	go func() { ch <- result{s.buildExternalSignalSection(ctx, userID), 6} }()
 
-	for range [5]struct{}{} {
+	for range [6]struct{}{} {
 		r := <-ch
 		brief.Sections[r.idx] = r.section
 	}
@@ -328,9 +335,9 @@ func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningB
 
 	var stopItems, sellItems, tItems, holdItems []string
 	for _, r := range results {
-		pnlStr   := fmt.Sprintf("%+.1f%%", r.Snapshot.PnLPct*100)
+		pnlStr := fmt.Sprintf("%+.1f%%", r.Snapshot.PnLPct*100)
 		priceStr := fmt.Sprintf("¥%.2f", r.Snapshot.Price)
-		base     := fmt.Sprintf("%s（%s）现价 %s，盈亏 %s", r.StockName, r.StockCode, priceStr, pnlStr)
+		base := fmt.Sprintf("%s（%s）现价 %s，盈亏 %s", r.StockName, r.StockCode, priceStr, pnlStr)
 		divSuffix := ""
 		if div, ok := divMap[r.StockCode]; ok {
 			switch div.DaysUntil {
@@ -422,7 +429,7 @@ func (s *MorningBriefService) buildReportSection(ctx context.Context) MorningBri
 		return sec
 	}
 	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-	todayStr  := time.Now().Format("2006-01-02")
+	todayStr := time.Now().Format("2006-01-02")
 	for _, r := range page.Items {
 		dateStr := r.PublishDate.Format("2006-01-02")
 		if dateStr != todayStr && dateStr != yesterday {
@@ -482,6 +489,34 @@ func (s *MorningBriefService) buildValuationSection(ctx context.Context, userID 
 		sec.Items = append(sec.Items, "高估注意："+strings.Join(overvaluedNames, "、")+"，酌情减仓")
 	}
 	return sec
+}
+
+// getWatchAndPlanCodes 合并自选股与活跃买入计划的股票代码（去重）
+func (s *MorningBriefService) getWatchAndPlanCodes(ctx context.Context, userID int64) []string {
+	codeSet := make(map[string]struct{})
+
+	if watchlist, err := s.watchlistRepo.ListByUser(ctx, userID); err == nil {
+		for _, w := range watchlist {
+			if w.StockCode != "" {
+				codeSet[w.StockCode] = struct{}{}
+			}
+		}
+	}
+
+	if plans, err := s.buyPlanRepo.ListByUser(ctx, userID,
+		[]model.BuyPlanStatus{model.BuyPlanStatusWatching, model.BuyPlanStatusReady}); err == nil {
+		for _, p := range plans {
+			if p.StockCode != "" {
+				codeSet[p.StockCode] = struct{}{}
+			}
+		}
+	}
+
+	codes := make([]string, 0, len(codeSet))
+	for code := range codeSet {
+		codes = append(codes, code)
+	}
+	return codes
 }
 
 func (s *MorningBriefService) buildAIComment(ctx context.Context, brief *MorningBriefDTO) string {

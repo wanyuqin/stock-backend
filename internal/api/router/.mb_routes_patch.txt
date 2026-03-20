@@ -1,0 +1,14 @@
+		mb := v1.Group("/morning-brief")
+		{
+			mb.GET("", morningBriefHandler.Get) // 兼容旧接口
+			sections := mb.Group("/sections")
+			{
+				sections.GET("/market",     morningBriefHandler.GetMarket)
+				sections.GET("/position",   morningBriefHandler.GetPosition)
+				sections.GET("/buy-plans",  morningBriefHandler.GetBuyPlans)
+				sections.GET("/reports",    morningBriefHandler.GetReports)
+				sections.GET("/valuation",  morningBriefHandler.GetValuation)
+				sections.GET("/news",       morningBriefHandler.GetNews)
+				sections.GET("/ai-comment", morningBriefHandler.GetAIComment)
+			}
+		}
