@@ -101,7 +101,6 @@ func NewAuditService(
 // ─────────────────────────────────────────────────────────────────
 
 func (s *AuditService) SubmitReview(ctx context.Context, userID int64, req *SubmitReviewRequest) (*ReviewDetailDTO, error) {
-	// 1. 查找已有复盘，没有则初始化
 	rev, err := s.reviewRepo.GetByTradeLogID(ctx, req.TradeLogID)
 	if err != nil {
 		rev, err = s.initFromTradeLogID(ctx, userID, req.TradeLogID)
@@ -110,7 +109,6 @@ func (s *AuditService) SubmitReview(ctx context.Context, userID int64, req *Subm
 		}
 	}
 
-	// 2. 更新用户填写的字段
 	if req.MentalState != "" {
 		rev.MentalState = req.MentalState
 	}
@@ -121,12 +119,10 @@ func (s *AuditService) SubmitReview(ctx context.Context, userID int64, req *Subm
 		rev.Tags = model.StringArray(req.Tags)
 	}
 
-	// 3. 更新买卖理由并重跑一致性审计
 	if req.BuyReason != "" || req.SellReason != "" {
 		if err := s.tradeV2Repo.UpdateReasons(ctx, req.TradeLogID, req.BuyReason, req.SellReason); err != nil {
 			s.log.Warn("update trade reasons failed", zap.Error(err))
 		}
-		// FIX: 直接用 GetByID 精确查卖出记录，不再全量遍历
 		sell, buyLog, fetchErr := s.fetchSellAndBuy(ctx, userID, req.TradeLogID)
 		if fetchErr == nil && sell != nil {
 			buyReason := req.BuyReason
@@ -145,7 +141,6 @@ func (s *AuditService) SubmitReview(ctx context.Context, userID int64, req *Subm
 		return nil, fmt.Errorf("保存复盘失败: %w", err)
 	}
 
-	// 4. 可选触发 AI 审计（异步）
 	if req.TriggerAI {
 		go func() {
 			bgCtx := context.Background()
@@ -159,7 +154,7 @@ func (s *AuditService) SubmitReview(ctx context.Context, userID int64, req *Subm
 }
 
 // ─────────────────────────────────────────────────────────────────
-// GetDashboard — GET /api/v1/review/dashboard
+// GetDashboard
 // ─────────────────────────────────────────────────────────────────
 
 func (s *AuditService) GetDashboard(ctx context.Context, userID int64) (*DashboardDTO, error) {
@@ -167,12 +162,10 @@ func (s *AuditService) GetDashboard(ctx context.Context, userID int64) (*Dashboa
 	if err != nil {
 		return nil, fmt.Errorf("获取看板数据失败: %w", err)
 	}
-
 	recent, err := s.reviewRepo.ListByUser(ctx, userID, 5, 0)
 	if err != nil {
 		recent = []*repo.TradeReviewWithTrade{}
 	}
-
 	return &DashboardDTO{
 		DashboardStats: stats,
 		RecentReviews:  recent,
@@ -190,6 +183,7 @@ func (s *AuditService) CountReviews(ctx context.Context, userID int64) (int64, e
 
 // ─────────────────────────────────────────────────────────────────
 // GenerateAIAudit — AI 审计（写入 ai_audit_comment）
+// 现在会使用 BuyContext 数据充实 prompt，让审计更精准
 // ─────────────────────────────────────────────────────────────────
 
 func (s *AuditService) GenerateAIAudit(ctx context.Context, reviewID int64) error {
@@ -198,11 +192,13 @@ func (s *AuditService) GenerateAIAudit(ctx context.Context, reviewID int64) erro
 		return fmt.Errorf("找不到复盘记录 id=%d: %w", reviewID, err)
 	}
 
-	// FIX: 用 GetByTradeLogID 精确查，不再 ListByUser(1000) 遍历
 	withTrade, err := s.reviewRepo.GetWithTradeByID(ctx, reviewID)
 	if err != nil {
 		return fmt.Errorf("找不到关联交易数据 review_id=%d: %w", reviewID, err)
 	}
+
+	// 把买入上下文挂到 withTrade（用于 prompt 构建）
+	withTrade.TradeReview.BuyContext = rev.BuyContext
 
 	prompt := buildAuditPrompt(withTrade)
 
@@ -245,7 +241,6 @@ func (s *AuditService) RunPriceTracker(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	// 按 stock_code 分组，减少 K 线接口请求次数
 	grouped := make(map[string][]*model.TradeReview)
 	for _, r := range pending {
 		grouped[r.StockCode] = append(grouped[r.StockCode], r)
@@ -253,15 +248,12 @@ func (s *AuditService) RunPriceTracker(ctx context.Context) (int, error) {
 
 	updated := 0
 	for code, reviews := range grouped {
-		// 拉多一点以确保覆盖最近的卖出日
 		klineResp, err := s.stockSvc.GetKLine(code, 30)
 		if err != nil {
 			s.log.Warn("price tracker: get kline failed", zap.String("code", code), zap.Error(err))
 			continue
 		}
-
 		for _, rev := range reviews {
-			// 需要知道卖出日期，从关联交易记录获取
 			withTrade, err := s.reviewRepo.GetWithTradeByID(ctx, rev.ID)
 			if err != nil {
 				s.log.Warn("price tracker: get trade failed", zap.Int64("id", rev.ID), zap.Error(err))
@@ -296,7 +288,6 @@ func (s *AuditService) InitReviewsForRecentSells(ctx context.Context, userID int
 
 	created := 0
 	for _, sell := range sells {
-		// 幂等：已存在则跳过
 		if _, err := s.reviewRepo.GetByTradeLogID(ctx, sell.ID); err == nil {
 			continue
 		}
@@ -318,8 +309,6 @@ func (s *AuditService) InitReviewsForRecentSells(ctx context.Context, userID int
 // 核心内部逻辑
 // ═══════════════════════════════════════════════════════════════
 
-// fillPriceTracking 用 K 线数据填充卖出后 1/3/5 日价格
-// FIX: 接收真实的卖出时间 sellTime，不再依赖 rev.CreatedAt
 func (s *AuditService) fillPriceTracking(rev *model.TradeReview, kline *KLineResponse, sellTime time.Time) bool {
 	if rev.PriceAtSell == nil {
 		return false
@@ -329,7 +318,6 @@ func (s *AuditService) fillPriceTracking(rev *model.TradeReview, kline *KLineRes
 		return false
 	}
 
-	// 用卖出时间匹配 K 线日期
 	sellDateStr := sellTime.Format("2006-01-02")
 	sellIdx := -1
 	for i, k := range kline.KLines {
@@ -338,7 +326,6 @@ func (s *AuditService) fillPriceTracking(rev *model.TradeReview, kline *KLineRes
 			break
 		}
 	}
-	// 找不到精确日期：找最近的较早日期
 	if sellIdx == -1 {
 		for i := len(kline.KLines) - 1; i >= 0; i-- {
 			if kline.KLines[i].Date <= sellDateStr {
@@ -348,7 +335,6 @@ func (s *AuditService) fillPriceTracking(rev *model.TradeReview, kline *KLineRes
 		}
 	}
 	if sellIdx == -1 || sellIdx+1 >= len(kline.KLines) {
-		// K 线数据不足以追踪，等下次
 		return false
 	}
 
@@ -393,6 +379,7 @@ func (s *AuditService) fillPriceTracking(rev *model.TradeReview, kline *KLineRes
 }
 
 // buildReviewFromSell 从 SELL 记录构建复盘草稿
+// ★ 新增：自动运行买入价格行为分析（BuyContext）
 func (s *AuditService) buildReviewFromSell(
 	ctx context.Context,
 	userID int64,
@@ -410,17 +397,69 @@ func (s *AuditService) buildReviewFromSell(
 
 	buy, err := s.tradeV2Repo.GetMatchedBuy(ctx, userID, sell.StockCode, sell.TradedAt)
 	if err == nil && buy != nil {
-		pnl := (sell.Price - buy.Price) / buy.Price
-		rev.PnlPct = &pnl
-		// FIX: 传入真实的卖出时间和买入记录
+		// 含手续费的真实盈亏（万一免五：买0.01% + 卖0.06%）
+		netPnl := (sell.Price*(1-0.0006) - buy.Price*(1+0.0001)) / (buy.Price * (1 + 0.0001))
+		rev.PnlPct = &netPnl
+
+		// 文字规则的逻辑一致性检测
 		s.runConsistencyAudit(ctx, rev, buy.BuyReason, sell.SellReason, buy, sell.TradedAt)
+
+		// ★ 价格行为上下文分析（异步，不阻断主流程）
+		go s.analyzeBuyContextAsync(rev.StockCode, buy.Price, buy.TradedAt, rev.ID)
 	}
 
 	return rev, nil
 }
 
-// runConsistencyAudit 检测逻辑冲突
-// FIX: 新增 sellTime 参数，持仓时间用 sellTime - buyLog.TradedAt 计算
+// analyzeBuyContextAsync 异步分析买入上下文，拉取K线并写回数据库
+func (s *AuditService) analyzeBuyContextAsync(code string, buyPrice float64, buyTime time.Time, reviewID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 需要买入日往前 30 根 K 线（含买入日本身）
+	kline, err := s.stockSvc.GetKLineEndAt(code, buyTime.Add(24*time.Hour), 35)
+	if err != nil {
+		s.log.Warn("analyzeBuyContext: fetch kline failed",
+			zap.String("code", code), zap.Error(err))
+		return
+	}
+	if len(kline.KLines) < 6 {
+		s.log.Warn("analyzeBuyContext: insufficient kline data",
+			zap.String("code", code), zap.Int("count", len(kline.KLines)))
+		return
+	}
+
+	buyCtx := AnalyzeBuyContext(kline.KLines, buyPrice, buyTime)
+
+	// 回写到 review 记录
+	rev, err := s.reviewRepo.GetByID(ctx, reviewID)
+	if err != nil {
+		s.log.Warn("analyzeBuyContext: review not found", zap.Int64("id", reviewID), zap.Error(err))
+		return
+	}
+	rev.BuyContext = buyCtx
+
+	// 如果量化分析发现追高，且文字规则没有检测到，升级逻辑一致性标志
+	if buyCtx.IsChasingHigh && rev.ConsistencyFlag == model.ConsistencyNormal {
+		rev.ConsistencyFlag = model.ConsistencyChasingHigh
+		rev.ConsistencyNote = fmt.Sprintf(
+			"价格行为检测：%s（不依赖理由文字）",
+			buyCtx.BuyLabel,
+		)
+	}
+
+	if err := s.reviewRepo.Update(ctx, rev); err != nil {
+		s.log.Warn("analyzeBuyContext: update failed", zap.Int64("id", reviewID), zap.Error(err))
+	} else {
+		s.log.Info("analyzeBuyContext: completed",
+			zap.String("code", code),
+			zap.String("label", buyCtx.BuyLabel),
+			zap.Bool("chasing_high", buyCtx.IsChasingHigh),
+		)
+	}
+}
+
+// runConsistencyAudit 文字规则的逻辑一致性检测（保留，与量化检测互补）
 func (s *AuditService) runConsistencyAudit(
 	_ context.Context,
 	rev *model.TradeReview,
@@ -431,7 +470,7 @@ func (s *AuditService) runConsistencyAudit(
 	buy := strings.ToLower(buyReason)
 	sell := strings.ToLower(sellReason)
 
-	// 规则 0：追高检测（MA20 偏离度）
+	// 规则 0：追高检测（MA20 偏离度）— 保留文字规则作为补充
 	if buyLog != nil && buyLog.Price > 0 {
 		aggressiveWords := []string{"打板", "追涨", "龙头", "妖股", "强势", "连板", "首板", "二板"}
 		isAggressive := false
@@ -465,8 +504,6 @@ func (s *AuditService) runConsistencyAudit(
 		}
 	}
 
-	// 规则 1：买入理由含长线词，但持仓时间极短
-	// FIX: 持仓天数 = 卖出时间 - 买入时间（不再用 rev.CreatedAt）
 	holdDays := 0
 	if buyLog != nil && !buyLog.TradedAt.IsZero() && !sellTime.IsZero() {
 		holdDays = int(sellTime.Sub(buyLog.TradedAt).Hours() / 24)
@@ -483,7 +520,6 @@ func (s *AuditService) runConsistencyAudit(
 		}
 	}
 
-	// 规则 2：盈利不足但卖出理由含目标词 → 过早止盈
 	if rev.PnlPct != nil {
 		pnlPct := *rev.PnlPct * 100
 		for _, kw := range targetKeywords {
@@ -498,7 +534,6 @@ func (s *AuditService) runConsistencyAudit(
 		}
 	}
 
-	// 规则 3：盈利时卖出理由含恐慌词 → 恐慌卖出
 	panicWords := []string{"止损", "跌破", "恐慌", "割肉", "害怕", "跌太多"}
 	for _, kw := range panicWords {
 		if strings.Contains(sell, kw) && rev.PnlPct != nil && *rev.PnlPct > 0 {
@@ -515,11 +550,9 @@ func (s *AuditService) runConsistencyAudit(
 	rev.ConsistencyNote = ""
 }
 
-// initFromTradeLogID 通过 trade_log_id 初始化复盘记录
 func (s *AuditService) initFromTradeLogID(
 	ctx context.Context, userID int64, tradeLogID int64,
 ) (*model.TradeReview, error) {
-	// 回溯 1 年
 	sells, err := s.tradeV2Repo.GetSellsInRange(
 		ctx, userID, time.Now().AddDate(-1, 0, 0), time.Now(),
 	)
@@ -548,11 +581,9 @@ func (s *AuditService) toDetailDTO(_ context.Context, rev *model.TradeReview) *R
 	}
 }
 
-// fetchSellAndBuy 精确查询指定卖出记录和对应的买入记录
 func (s *AuditService) fetchSellAndBuy(
 	ctx context.Context, userID int64, tradeLogID int64,
 ) (*model.TradeLogV2, *model.TradeLogV2, error) {
-	// 回溯 1 年内的 SELL
 	sells, err := s.tradeV2Repo.GetSellsInRange(
 		ctx, userID, time.Now().AddDate(-1, 0, 0), time.Now(),
 	)
@@ -569,7 +600,7 @@ func (s *AuditService) fetchSellAndBuy(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Prompt 工程
+// Prompt 工程 — 整合 BuyContext 数据
 // ═══════════════════════════════════════════════════════════════
 
 func buildAuditPrompt(item *repo.TradeReviewWithTrade) string {
@@ -596,28 +627,61 @@ func buildAuditPrompt(item *repo.TradeReviewWithTrade) string {
 		mentalContext = fmt.Sprintf("\n交易时情绪自评：%s", item.MentalState)
 	}
 
+	// ★ 新增：买入上下文数据段（基于K线，不依赖理由文字）
+	buyContextSection := ""
+	if item.BuyContext != nil && item.BuyContext.DataSufficient {
+		bc := item.BuyContext
+		trendStr := "MA20向上"
+		if !bc.MA20Uptrend {
+			trendStr = "MA20向下"
+		}
+		buyContextSection = fmt.Sprintf(`
+=== 买入价格行为分析（客观数据，不依赖理由文字）===
+买入标签：%s
+买入日期：%s，买入价：¥%.2f
+日内位置：%.0f%%（0%%=最低 100%%=最高）
+MA20偏离：%+.1f%%（MA20=¥%.2f，趋势：%s）
+量能：量比 %.1fx（当日 %d 手 vs 5日均量 %.0f 手）
+前3日涨幅：%+.1f%%，前10日涨幅：%+.1f%%
+顺势状态：%v（MA5/MA20同向）
+行为判断：追高=%v，低吸=%v，量能突破=%v`,
+			bc.BuyLabel,
+			bc.BuyDate, bc.BuyPrice,
+			bc.BuyPositionInDayRange*100,
+			bc.MA20DeviationPct, bc.MA20, trendStr,
+			bc.VolumeRatioVs5d, bc.DayVolume, bc.AvgVol5d,
+			bc.Prior3dGainPct, bc.Prior10dGainPct,
+			bc.IsTrendAligned,
+			bc.IsChasingHigh, bc.IsBottomFishing, bc.IsVolumeBreakout,
+		)
+	}
+
 	return fmt.Sprintf(`你是一个毒舌且理性的职业交易员，正在对一位散户的交易进行复盘审计。
 你的风格是：直接、犀利、不安慰、只讲事实和逻辑。
 
 === 交易数据 ===
 股票：%s（%s）
-买入理由：%s
-卖出理由：%s
-本次盈亏：%.2f%%
+买入理由（用户填写）：%s
+卖出理由（用户填写）：%s
+本次盈亏（含万一免五手续费）：%.2f%%
 卖出后 5 日涨幅：%.2f%%
-卖出后 5 日最高偏离（后悔指数）：%.2f%%%s%s
+卖出后 5 日最高偏离（后悔指数）：%.2f%%%s%s%s
 
 === 审计要求 ===
 请按以下结构输出，每项必须基于数据说话：
 
-## 🔍 卖出动机诊断
+## 🔍 买入行为诊断
+重点分析买入时的价格行为数据（日内位置、MA偏离、量能、趋势），判断是追高/低吸/顺势/逆势。
+如果有买入上下文数据，必须基于这些客观数据下判断，不能只看理由文字。
+
+## 📤 卖出动机诊断
 判断这次卖出是基于「逻辑」还是「恐惧/贪婪」？给出具体证据。
 
 ## 📉 机会成本分析
 卖出后股价走势如何？是否存在"卖飞"？后悔指数 %.2f%% 说明了什么？
 
 ## 🧠 逻辑一致性
-买入逻辑和卖出行为是否自洽？如果有矛盾，直接点出。
+买入时的价格行为和卖出行为是否自洽？指出主要矛盾。
 
 ## ⚡ 执行力评分
 给出 1-100 的执行力评分，并说明扣分原因。
@@ -629,7 +693,7 @@ func buildAuditPrompt(item *repo.TradeReviewWithTrade) string {
 		emptyStr(item.BuyReason, "未填写"),
 		emptyStr(item.SellReason, "未填写"),
 		pnl, post5d, regret,
-		consistencyContext, mentalContext,
+		consistencyContext, mentalContext, buyContextSection,
 		regret,
 	)
 }

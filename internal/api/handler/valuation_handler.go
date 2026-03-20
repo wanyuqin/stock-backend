@@ -28,10 +28,15 @@ func (h *ValuationHandler) GetValuation(c *gin.Context) {
 		return
 	}
 
-	snap, err := h.svc.GetValuation(c.Request.Context(), code)
+	source := c.Query("source")
+	if source == "" {
+		source = h.svc.DefaultMarketSource()
+	}
+
+	snap, err := h.svc.GetValuationBySource(c.Request.Context(), code, source)
 	if err != nil {
 		h.log.Warn("ValuationHandler.GetValuation failed",
-			zap.String("code", code), zap.Error(err))
+			zap.String("code", code), zap.String("source", source), zap.Error(err))
 		InternalError(c, "获取估值失败: "+err.Error())
 		return
 	}
@@ -64,7 +69,12 @@ func (h *ValuationHandler) GetSummary(c *gin.Context) {
 // POST /api/v1/market/valuation-sync
 // 手动触发自选股估值同步（今日数据）。
 func (h *ValuationHandler) TriggerSync(c *gin.Context) {
-	result, err := h.svc.SyncWatchlistValuations(c.Request.Context(), defaultUserID)
+	source := c.Query("source")
+	if source == "" {
+		source = h.svc.DefaultMarketSource()
+	}
+
+	result, err := h.svc.SyncWatchlistValuationsBySource(c.Request.Context(), defaultUserID, source)
 	if err != nil {
 		h.log.Error("ValuationHandler.TriggerSync failed", zap.Error(err))
 		InternalError(c, "同步失败: "+err.Error())

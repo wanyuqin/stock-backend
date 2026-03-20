@@ -122,3 +122,18 @@ func (h *BuyPlanHandler) CheckTriggers(c *gin.Context) {
 	}
 	OK(c, gin.H{"triggered": len(triggered), "items": triggered})
 }
+
+// POST /api/v1/buy-plans/backtest
+func (h *BuyPlanHandler) Backtest(c *gin.Context) {
+	var req service.SmartPlanBacktestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+	result, err := h.svc.BacktestSmartPlan(c.Request.Context(), &req)
+	if err != nil {
+		BadRequest(c, err.Error())
+		return
+	}
+	OK(c, result)
+}

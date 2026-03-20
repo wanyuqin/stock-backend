@@ -31,7 +31,7 @@ func NewAnalysisHandler(
 // Query:
 //   limit=120         K 线根数（默认 120，东财日K）
 //   period=daily      周期，目前只支持 daily
-//   source=em|qq      数据源，em=东方财富(默认)，qq=腾讯证券
+//   source=qq|em      数据源（默认读取服务配置）
 //
 // 腾讯数据源说明：
 //   - 仅支持近 5 个交易日（接口限制）
@@ -52,19 +52,17 @@ func (h *AnalysisHandler) GetKLine(c *gin.Context) {
 		}
 	}
 
-	source := c.DefaultQuery("source", "em") // "em" | "qq"
+	source := c.Query("source")
+	if source == "" {
+		source = h.stockSvc.DefaultMarketSource()
+	}
 
 	var (
 		klineData *service.KLineResponse
 		err       error
 	)
 
-	switch source {
-	case "qq":
-		klineData, err = h.stockSvc.GetKLineQQ(code, limit)
-	default: // "em"
-		klineData, err = h.stockSvc.GetKLine(code, limit)
-	}
+	klineData, err = h.stockSvc.GetKLineBySource(code, limit, source)
 
 	if err != nil {
 		h.log.Error("GetKLine failed",
@@ -151,10 +149,17 @@ func (h *AnalysisHandler) GetAnalysis(c *gin.Context) {
 		return
 	}
 
-	quote, err := h.stockSvc.GetRealtimeQuote(code)
+	source := c.Query("source")
+	if source == "" {
+		source = h.stockSvc.DefaultMarketSource()
+	}
+
+	quote, err := h.stockSvc.GetRealtimeQuoteBySource(code, source)
 	if err != nil {
 		h.log.Error("GetAnalysis: fetch quote failed",
-			zap.String("code", code), zap.Error(err))
+			zap.String("code", code),
+			zap.String("source", source),
+			zap.Error(err))
 		c.JSON(http.StatusBadGateway, Response{
 			Code:    50200,
 			Message: "获取行情数据失败，无法进行 AI 分析: " + err.Error(),

@@ -69,6 +69,7 @@ type PositionGuardianRepo interface {
 	GetByCode(ctx context.Context, code string) (*model.PositionDetail, error)
 	Upsert(ctx context.Context, p *model.PositionDetail) error
 	SaveDiagnostic(ctx context.Context, d *model.PositionDiagnostic) error
+	ListDiagnosticsByCodes(ctx context.Context, codes []string, from time.Time) ([]*model.PositionDiagnostic, error)
 }
 
 // SnapshotRepo 全市场每日快照访问接口。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,13 +41,14 @@ import (
 // ═══════════════════════════════════════════════════════════════
 
 const (
-	emSlistURL    = "https://push2.eastmoney.com/api/qt/slist/get"
-	emSlistUt     = "fa5fd1943c7b386f172d6893dbfba10b"
+	emSlistURL       = "https://push2.eastmoney.com/api/qt/slist/get"
+	emSlistUt        = "fa5fd1943c7b386f172d6893dbfba10b"
 	emSectorMarketID = 90 // 板块固定 market_id
 
 	// 内存缓存 TTL
-	sectorQuoteCacheTTL  = 10 * time.Second  // 实时行情短缓存
+	sectorQuoteCacheTTL   = 10 * time.Second // 实时行情短缓存
 	sectorMappingCacheTTL = 6 * time.Hour    // 板块归属变动频率低，6h 内存缓存
+	sectorMappingMissTTL  = 30 * time.Minute // 远程明确无行业映射时的负缓存，避免日志刷屏
 )
 
 // ─────────────────────────────────────────────────────────────────
@@ -66,24 +68,24 @@ type SectorQuote struct {
 
 // SectorInfo 最终对外暴露的板块信息（嵌入持仓诊断结果）
 type SectorInfo struct {
-	SectorCode           string  `json:"sector_code"`            // BK0726
-	SectorName           string  `json:"sector_name"`            // 印制电路板
-	SectorChangePercent  float64 `json:"sector_change_percent"`  // 板块今日涨跌幅（%）
-	RelativeStrength     float64 `json:"relative_strength"`      // RS = 个股涨跌幅 - 板块涨跌幅
-	RSLabel              string  `json:"rs_label"`               // 强弱文本描述
-	RSLevel              string  `json:"rs_level"`               // "strong" | "normal" | "weak" | "critical"
+	SectorCode          string  `json:"sector_code"`           // BK0726
+	SectorName          string  `json:"sector_name"`           // 印制电路板
+	SectorChangePercent float64 `json:"sector_change_percent"` // 板块今日涨跌幅（%）
+	RelativeStrength    float64 `json:"relative_strength"`     // RS = 个股涨跌幅 - 板块涨跌幅
+	RSLabel             string  `json:"rs_label"`              // 强弱文本描述
+	RSLevel             string  `json:"rs_level"`              // "strong" | "normal" | "weak" | "critical"
 }
 
 // RelativeStrength 内部计算结构（兼容 position_guardian_service.go 调用）
 type RelativeStrength struct {
-	StockCode           string  `json:"stock_code"`
-	StockChangeToday    float64 `json:"stock_change_today"`    // 个股今日涨跌幅（%）
-	SectorChangeToday   float64 `json:"sector_change_today"`   // 板块今日涨跌幅（%）
-	SectorName          string  `json:"sector_name"`
-	SectorCode          string  `json:"sector_code"`
-	Diff                float64 `json:"diff"`                  // RS = 个股 - 板块
-	IsWeaker            bool    `json:"is_weaker"`             // RS < -weakThreshold
-	WeakerThreshold     float64 `json:"weaker_threshold"`
+	StockCode         string  `json:"stock_code"`
+	StockChangeToday  float64 `json:"stock_change_today"`  // 个股今日涨跌幅（%）
+	SectorChangeToday float64 `json:"sector_change_today"` // 板块今日涨跌幅（%）
+	SectorName        string  `json:"sector_name"`
+	SectorCode        string  `json:"sector_code"`
+	Diff              float64 `json:"diff"`      // RS = 个股 - 板块
+	IsWeaker          bool    `json:"is_weaker"` // RS < -weakThreshold
+	WeakerThreshold   float64 `json:"weaker_threshold"`
 	// 5日兼容字段（供 snapshot 历史字段使用）
 	StockChange5D  float64 `json:"stock_change_5d"`
 	SectorChange5D float64 `json:"sector_change_5d"`
@@ -170,10 +172,15 @@ func (p *SectorProvider) SyncSectorMapping(ctx context.Context, stockCode string
 // GetSectorRelation 获取个股所属行业板块（内存 → DB → 远程，逐级降级）
 func (p *SectorProvider) GetSectorRelation(ctx context.Context, stockCode string) (*model.StockSectorRelation, error) {
 	cacheKey := "rel:" + stockCode
+	missKey := "rel-miss:" + stockCode
 
 	// 1. 内存缓存
 	if cached, found := p.memCache.Get(cacheKey); found {
 		return cached.(*model.StockSectorRelation), nil
+	}
+	// 1.1 负缓存：最近已确认无行业映射，直接降级
+	if _, found := p.memCache.Get(missKey); found {
+		return nil, nil
 	}
 
 	// 2. DB 缓存
@@ -187,7 +194,12 @@ func (p *SectorProvider) GetSectorRelation(ctx context.Context, stockCode string
 	}
 
 	// 3. 远程同步
-	return p.SyncSectorMapping(ctx, stockCode)
+	rel, err = p.SyncSectorMapping(ctx, stockCode)
+	if err != nil && isNoSectorFoundErr(err) {
+		p.memCache.Set(missKey, true, sectorMappingMissTTL)
+		return nil, nil
+	}
+	return rel, err
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -247,8 +259,13 @@ func (p *SectorProvider) GetRelativeStrength(
 	rel, err := p.GetSectorRelation(ctx, stockCode)
 	if err != nil || rel == nil {
 		if err != nil {
-			p.log.Warn("GetRelativeStrength: no sector relation",
-				zap.String("code", stockCode), zap.Error(err))
+			if isNoSectorFoundErr(err) {
+				p.log.Info("GetRelativeStrength: no sector mapping, fallback to stock-only",
+					zap.String("code", stockCode))
+			} else {
+				p.log.Warn("GetRelativeStrength: no sector relation",
+					zap.String("code", stockCode), zap.Error(err))
+			}
 		}
 		return &RelativeStrength{
 			StockCode:        stockCode,
@@ -286,18 +303,25 @@ func (p *SectorProvider) GetRelativeStrength(
 	isWeaker := diff < -weakThreshold
 
 	return &RelativeStrength{
-		StockCode:        stockCode,
-		StockChangeToday: stockChangeToday,
+		StockCode:         stockCode,
+		StockChangeToday:  stockChangeToday,
 		SectorChangeToday: sectorChange,
-		SectorName:       rel.SectorName,
-		SectorCode:       rel.SectorCode,
-		Diff:             diff,
-		IsWeaker:         isWeaker,
-		WeakerThreshold:  weakThreshold,
+		SectorName:        rel.SectorName,
+		SectorCode:        rel.SectorCode,
+		Diff:              diff,
+		IsWeaker:          isWeaker,
+		WeakerThreshold:   weakThreshold,
 		// 5日兼容字段（当前以今日数据填充，如需 5 日可后续扩展）
 		StockChange5D:  stockChangeToday,
 		SectorChange5D: sectorChange,
 	}, nil
+}
+
+func isNoSectorFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "no sector found")
 }
 
 // BuildSectorInfo 将 RelativeStrength 转换为对外 SectorInfo DTO

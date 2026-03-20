@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
 	"stock-backend/internal/model"
@@ -78,13 +79,19 @@ type PerformanceReport struct {
 // ═══════════════════════════════════════════════════════════════
 
 type TradeService struct {
-	repo   repo.TradeLogRepo
-	market *MarketProvider
-	log    *zap.Logger
+	repo    repo.TradeLogRepo
+	posRepo repo.PositionGuardianRepo
+	market  *MarketProvider
+	log     *zap.Logger
 }
 
-func NewTradeService(r repo.TradeLogRepo, stockSvc *StockService, log *zap.Logger) *TradeService {
-	return &TradeService{repo: r, market: stockSvc.market, log: log}
+func NewTradeService(
+	r repo.TradeLogRepo,
+	posRepo repo.PositionGuardianRepo,
+	stockSvc *StockService,
+	log *zap.Logger,
+) *TradeService {
+	return &TradeService{repo: r, posRepo: posRepo, market: stockSvc.market, log: log}
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -116,6 +123,9 @@ func (s *TradeService) AddTradeLog(ctx context.Context, userID int64, req *AddTr
 		"id", t.ID, "code", t.StockCode,
 		"action", t.Action, "price", t.Price, "volume", t.Volume,
 	)
+	if err := s.syncPositionsFromTrades(ctx, userID); err != nil {
+		s.log.Warn("sync positions after create trade failed", zap.Int64("user_id", userID), zap.Error(err))
+	}
 	return toDTO(t), nil
 }
 
@@ -132,7 +142,6 @@ func (s *TradeService) UpdateTradeLog(ctx context.Context, userID, id int64, req
 		return nil, fmt.Errorf("无权限操作此记录")
 	}
 
-	// 更新可修改的字段
 	if req.Action != "" {
 		action := strings.ToUpper(req.Action)
 		if action != "BUY" && action != "SELL" {
@@ -159,13 +168,15 @@ func (s *TradeService) UpdateTradeLog(ctx context.Context, userID, id int64, req
 		}
 		t.TradedAt = tradedAt
 	}
-	// reason 允许改为空字符串
 	t.Reason = strings.TrimSpace(req.Reason)
 
 	if err := s.repo.Update(ctx, t); err != nil {
 		return nil, fmt.Errorf("更新交易记录失败: %w", err)
 	}
 	s.log.Sugar().Infow("trade log updated", "id", id, "user_id", userID)
+	if err := s.syncPositionsFromTrades(ctx, userID); err != nil {
+		s.log.Warn("sync positions after update trade failed", zap.Int64("user_id", userID), zap.Error(err))
+	}
 	return toDTO(t), nil
 }
 
@@ -178,6 +189,9 @@ func (s *TradeService) DeleteTradeLog(ctx context.Context, userID, id int64) err
 		return fmt.Errorf("删除交易记录失败: %w", err)
 	}
 	s.log.Sugar().Infow("trade log deleted", "id", id, "user_id", userID)
+	if err := s.syncPositionsFromTrades(ctx, userID); err != nil {
+		s.log.Warn("sync positions after delete trade failed", zap.Int64("user_id", userID), zap.Error(err))
+	}
 	return nil
 }
 
@@ -365,6 +379,13 @@ type costLot struct {
 	remaining int64
 }
 
+type positionLot struct {
+	price     float64
+	remaining int64
+	boughtAt  time.Time
+	reason    string
+}
+
 func calcPositionFIFO(code string, logs []*model.TradeLog) *PositionSummary {
 	pos := &PositionSummary{StockCode: code}
 	queue := make([]costLot, 0, 8)
@@ -409,3 +430,145 @@ func calcPositionFIFO(code string, logs []*model.TradeLog) *PositionSummary {
 
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
+
+// syncPositionsFromTrades — 全自动 FIFO 模式
+//
+// 遍历所有交易日志，用 FIFO 重算每只股票的持仓。
+// 对于在交易日志中有 BUY 记录的股票：完全由 FIFO 结果覆盖（全自动）。
+// 对于只有 SELL 或根本没有出现在日志里的股票：跳过，不覆盖，
+// 保留通过「持仓守护-录入持仓」手动维护的数据——防止已补录买入前的短暂过渡期数据丢失。
+func (s *TradeService) syncPositionsFromTrades(ctx context.Context, userID int64) error {
+	if s.posRepo == nil {
+		return nil
+	}
+	logs, err := s.repo.ListAllByUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("list trades: %w", err)
+	}
+
+	// 第一遍：FIFO 重建 queues，同时记录哪些股票有买入日志
+	type lotQueue = []positionLot
+	queues   := make(map[string]lotQueue, 64)
+	hasBuyLog := make(map[string]bool, 64)  // true = 该代码在日志中有 BUY 记录
+
+	for _, l := range logs {
+		if l == nil {
+			continue
+		}
+		code := strings.ToUpper(strings.TrimSpace(l.StockCode))
+		if code == "" {
+			continue
+		}
+		switch l.Action {
+		case model.TradeActionBuy:
+			hasBuyLog[code] = true
+			queues[code] = append(queues[code], positionLot{
+				price:    l.Price,
+				remaining: l.Volume,
+				boughtAt: l.TradedAt,
+				reason:   strings.TrimSpace(l.Reason),
+			})
+		case model.TradeActionSell:
+			remain := l.Volume
+			q := queues[code]
+			for remain > 0 && len(q) > 0 {
+				lot := &q[0]
+				match := remain
+				if match > lot.remaining {
+					match = lot.remaining
+				}
+				lot.remaining -= match
+				remain -= match
+				if lot.remaining == 0 {
+					q = q[1:]
+				}
+			}
+			queues[code] = q
+		}
+	}
+
+	// 第二遍：只更新有买入日志的股票（跳过纯手动录入的）
+	now   := time.Now()
+	today := now.Format("2006-01-02")
+
+	for code, hasB := range hasBuyLog {
+		if !hasB {
+			continue // 理论上 hasBuyLog 里全是 true，双重保险
+		}
+
+		existingPos, err := s.posRepo.GetByCode(ctx, code)
+		if err != nil {
+			return fmt.Errorf("get position %s: %w", code, err)
+		}
+
+		lots := queues[code]
+		var qty       int64
+		var totalCost float64
+		var lockedToday int64
+		var earliest *time.Time
+		buyReason := ""
+
+		for _, lot := range lots {
+			if lot.remaining <= 0 {
+				continue
+			}
+			qty       += lot.remaining
+			totalCost += lot.price * float64(lot.remaining)
+			if lot.boughtAt.Format("2006-01-02") == today {
+				lockedToday += lot.remaining
+			}
+			if earliest == nil || lot.boughtAt.Before(*earliest) {
+				t := lot.boughtAt
+				earliest = &t
+			}
+			if buyReason == "" && lot.reason != "" {
+				buyReason = lot.reason
+			}
+		}
+		// 如果日志里没填理由，沿用手动录入的理由
+		if buyReason == "" && existingPos != nil {
+			buyReason = existingPos.BuyReason
+		}
+
+		p := &model.PositionDetail{StockCode: code}
+
+		// 保留不由交易日志管理的字段（止损位、关联计划等）
+		if existingPos != nil {
+			p.HardStopLoss    = existingPos.HardStopLoss
+			p.LinkedPlanID    = existingPos.LinkedPlanID
+			p.PlanStopLoss    = existingPos.PlanStopLoss
+			p.PlanTargetPrice = existingPos.PlanTargetPrice
+			p.PlanBuyReason   = existingPos.PlanBuyReason
+		}
+
+		if qty <= 0 {
+			// FIFO 算出已完全清仓
+			p.AvgCost      = decimal.Zero
+			p.Quantity     = 0
+			p.AvailableQty = 0
+			p.BoughtAt     = nil
+			p.BuyReason    = ""
+			// 清仓时同时清掉止损/计划关联，避免残留
+			p.HardStopLoss    = nil
+			p.LinkedPlanID    = nil
+			p.PlanStopLoss    = nil
+			p.PlanTargetPrice = nil
+			p.PlanBuyReason   = ""
+		} else {
+			p.AvgCost     = decimal.NewFromFloat(totalCost / float64(qty))
+			p.Quantity    = int(qty)
+			avail := qty - lockedToday
+			if avail < 0 {
+				avail = 0
+			}
+			p.AvailableQty = int(avail)
+			p.BoughtAt     = earliest
+			p.BuyReason    = buyReason
+		}
+
+		if err := s.posRepo.Upsert(ctx, p); err != nil {
+			return fmt.Errorf("upsert position %s: %w", code, err)
+		}
+	}
+	return nil
+}

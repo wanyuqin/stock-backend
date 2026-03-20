@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +37,7 @@ const (
 )
 
 type valUlistResp struct {
-	RC   int    `json:"rc"`
+	RC   int `json:"rc"`
 	Data *struct {
 		Total int            `json:"total"`
 		Diff  []valUlistItem `json:"diff"`
@@ -59,21 +60,198 @@ type ValuationSyncResult struct {
 }
 
 type ValuationService struct {
-	valRepo       repo.ValuationRepo
-	watchlistRepo repo.WatchlistRepo
-	log           *zap.Logger
+	valRepo             repo.ValuationRepo
+	watchlistRepo       repo.WatchlistRepo
+	defaultMarketSource string
+	log                 *zap.Logger
 }
 
 func NewValuationService(
 	valRepo repo.ValuationRepo,
 	watchlistRepo repo.WatchlistRepo,
+	defaultMarketSource string,
 	log *zap.Logger,
 ) *ValuationService {
 	return &ValuationService{
-		valRepo:       valRepo,
-		watchlistRepo: watchlistRepo,
-		log:           log,
+		valRepo:             valRepo,
+		watchlistRepo:       watchlistRepo,
+		defaultMarketSource: normalizeMarketSource(defaultMarketSource),
+		log:                 log,
 	}
+}
+
+func (s *ValuationService) DefaultMarketSource() string { return s.defaultMarketSource }
+
+// GetValuationBySource 按 source 获取估值（当前 em 为主，qq 暂回退 em）。
+func (s *ValuationService) GetValuationBySource(ctx context.Context, code, source string) (*model.StockValuation, error) {
+	norm := normalizeMarketSource(sourceOrDefault(source, s.defaultMarketSource))
+	if norm == "qq" {
+		snap, err := s.getValuationFromQQ(ctx, code)
+		if err == nil {
+			return snap, nil
+		}
+		s.log.Warn("GetValuationBySource: qq failed, fallback to em",
+			zap.String("code", code), zap.Error(err))
+		recordDataSourceFallback("valuation", "qq", "em")
+	}
+	return s.GetValuation(ctx, code)
+}
+
+func (s *ValuationService) SyncWatchlistValuationsBySource(ctx context.Context, userID int64, source string) (*ValuationSyncResult, error) {
+	norm := normalizeMarketSource(sourceOrDefault(source, s.defaultMarketSource))
+	if norm == "qq" {
+		res, err := s.syncWatchlistValuationsFromQQ(ctx, userID)
+		if err == nil {
+			return res, nil
+		}
+		s.log.Warn("SyncWatchlistValuationsBySource: qq failed, fallback to em", zap.Error(err))
+		recordDataSourceFallback("valuation_sync", "qq", "em")
+	}
+	return s.SyncWatchlistValuations(ctx, userID)
+}
+
+func (s *ValuationService) getValuationFromQQ(ctx context.Context, code string) (*model.StockValuation, error) {
+	items, err := s.fetchQQValuation(ctx, []string{code})
+	if err != nil {
+		return nil, err
+	}
+	it, ok := items[code]
+	if !ok {
+		return nil, fmt.Errorf("qq valuation missing %s", code)
+	}
+	return s.persistValuationSnapshot(ctx, code, it.Name, it.PE, it.PB), nil
+}
+
+func (s *ValuationService) syncWatchlistValuationsFromQQ(ctx context.Context, userID int64) (*ValuationSyncResult, error) {
+	watchItems, err := s.watchlistRepo.ListByUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("ListByUser: %w", err)
+	}
+	if len(watchItems) == 0 {
+		return &ValuationSyncResult{}, nil
+	}
+	codes := make([]string, 0, len(watchItems))
+	for _, w := range watchItems {
+		codes = append(codes, w.StockCode)
+	}
+	result := &ValuationSyncResult{Total: len(codes)}
+	for _, batch := range splitBatches(codes, valBatchSize) {
+		items, e := s.fetchQQValuation(ctx, batch)
+		if e != nil {
+			result.Failed += len(batch)
+			continue
+		}
+		for _, code := range batch {
+			it, ok := items[code]
+			if !ok {
+				result.Failed++
+				continue
+			}
+			_ = s.persistValuationSnapshot(ctx, code, it.Name, it.PE, it.PB)
+			result.Success++
+		}
+	}
+	return result, nil
+}
+
+type qqValuationItem struct {
+	Name string
+	PE   *float64
+	PB   *float64
+}
+
+func (s *ValuationService) fetchQQValuation(ctx context.Context, codes []string) (map[string]qqValuationItem, error) {
+	qtCodes := make([]string, 0, len(codes))
+	normalized := make(map[string]string, len(codes))
+	for _, c := range codes {
+		code := strings.TrimSpace(c)
+		if code == "" {
+			continue
+		}
+		normalized[code] = code
+		qtCodes = append(qtCodes, toQTCode(code))
+	}
+	if len(qtCodes) == 0 {
+		return map[string]qqValuationItem{}, nil
+	}
+	body, err := fetchQQHTTP(ctx, fmt.Sprintf(qqQuoteURL, strings.Join(qtCodes, ",")))
+	if err != nil {
+		return nil, fmt.Errorf("qq valuation http: %w", err)
+	}
+	utf8Body, _ := gbkToUTF8(body)
+	if len(utf8Body) == 0 {
+		utf8Body = body
+	}
+	out := make(map[string]qqValuationItem, len(codes))
+	for _, line := range strings.Split(string(utf8Body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "v_") {
+			continue
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			continue
+		}
+		start := strings.Index(line, "\"")
+		end := strings.LastIndex(line, "\"")
+		if start < 0 || end <= start {
+			continue
+		}
+		fields := strings.Split(line[start+1:end], "~")
+		if len(fields) < 47 {
+			continue
+		}
+		code := strings.TrimSpace(fields[2])
+		if code == "" {
+			continue
+		}
+		pe := numPtr(parseQQFloat(fields, 39))
+		pb := numPtr(parseQQFloat(fields, 46))
+		out[code] = qqValuationItem{
+			Name: strings.TrimSpace(fields[1]),
+			PE:   pe,
+			PB:   pb,
+		}
+	}
+	return out, nil
+}
+
+func parseQQFloat(fields []string, idx int) float64 {
+	if idx < 0 || idx >= len(fields) {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(strings.TrimSpace(fields[idx]), 64)
+	return v
+}
+
+func numPtr(v float64) *float64 {
+	if v <= 0 {
+		return nil
+	}
+	v2 := math.Round(v*1000) / 1000
+	return &v2
+}
+
+func (s *ValuationService) persistValuationSnapshot(ctx context.Context, code, name string, peTTM, pb *float64) *model.StockValuation {
+	today := time.Now().Truncate(24 * time.Hour)
+	_ = s.valRepo.InsertHistory(ctx, &model.StockValuationHistory{
+		StockCode: code,
+		TradeDate: today,
+		PETTM:     peTTM,
+		PB:        pb,
+	})
+	pePercentile, pbPercentile, histDays := s.calcPercentiles(ctx, code, peTTM, pb)
+	snap := &model.StockValuation{
+		StockCode:    code,
+		StockName:    name,
+		PETTM:        peTTM,
+		PB:           pb,
+		PEPercentile: pePercentile,
+		PBPercentile: pbPercentile,
+		HistoryDays:  histDays,
+	}
+	_ = s.valRepo.UpsertSnapshot(ctx, snap)
+	return snap
 }
 
 // ─────────────────────────────────────────────────────────────────

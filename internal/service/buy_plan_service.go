@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,13 +65,41 @@ type UpdateBuyPlanRequest struct {
 
 type BuyPlanService struct {
 	repo        repo.BuyPlanRepo
+	stockSvc    *StockService
 	market      *MarketProvider
 	guardianSvc *PositionGuardianService // 执行计划时自动关联持仓（延迟注入避免循环依赖）
 	log         *zap.Logger
 }
 
 func NewBuyPlanService(r repo.BuyPlanRepo, stockSvc *StockService, log *zap.Logger) *BuyPlanService {
-	return &BuyPlanService{repo: r, market: stockSvc.market, log: log}
+	return &BuyPlanService{repo: r, stockSvc: stockSvc, market: stockSvc.market, log: log}
+}
+
+type SmartPlanBacktestRequest struct {
+	StockCode     string  `json:"stock_code" binding:"required"`
+	BuyPrice      float64 `json:"buy_price" binding:"required"`
+	BuyPriceHigh  float64 `json:"buy_price_high" binding:"required"`
+	StopLoss      float64 `json:"stop_loss" binding:"required"`
+	TargetPrice   float64 `json:"target_price" binding:"required"`
+	LookaheadDays int     `json:"lookahead_days"`
+	SampleDays    int     `json:"sample_days"`
+}
+
+type SmartPlanBacktestResult struct {
+	StockCode        string  `json:"stock_code"`
+	SampleDays       int     `json:"sample_days"`
+	LookaheadDays    int     `json:"lookahead_days"`
+	TotalSamples     int     `json:"total_samples"`
+	TriggeredSamples int     `json:"triggered_samples"`
+	WinSamples       int     `json:"win_samples"`
+	LossSamples      int     `json:"loss_samples"`
+	TimeoutSamples   int     `json:"timeout_samples"`
+	TriggerRatePct   float64 `json:"trigger_rate_pct"`
+	WinRatePct       float64 `json:"win_rate_pct"`
+	AvgReturnPct     float64 `json:"avg_return_pct"`
+	MedianReturnPct  float64 `json:"median_return_pct"`
+	AvgHoldDays      float64 `json:"avg_hold_days"`
+	ProfitFactor     float64 `json:"profit_factor"`
 }
 
 // SetGuardianSvc 延迟注入持仓守护服务（在 router 里 new 完两个服务后调用）
@@ -205,17 +234,39 @@ func (s *BuyPlanService) Update(ctx context.Context, userID int64, id int64, req
 		return nil, fmt.Errorf("无权限操作此计划")
 	}
 
-	if req.BuyPrice != nil         { plan.BuyPrice = req.BuyPrice }
-	if req.BuyPriceHigh != nil     { plan.BuyPriceHigh = req.BuyPriceHigh }
-	if req.TargetPrice != nil      { plan.TargetPrice = req.TargetPrice }
-	if req.StopLossPrice != nil    { plan.StopLossPrice = req.StopLossPrice }
-	if req.PlannedVolume != nil    { plan.PlannedVolume = *req.PlannedVolume }
-	if req.PlannedAmount != nil    { plan.PlannedAmount = req.PlannedAmount }
-	if req.PositionRatio != nil    { plan.PositionRatio = req.PositionRatio }
-	if req.BuyBatches != nil       { plan.BuyBatches = maxInt(1, *req.BuyBatches) }
-	if req.Reason != nil           { plan.Reason = strings.TrimSpace(*req.Reason) }
-	if req.Catalyst != nil         { plan.Catalyst = strings.TrimSpace(*req.Catalyst) }
-	if req.TriggerConditions != nil { plan.TriggerConditions = *req.TriggerConditions }
+	if req.BuyPrice != nil {
+		plan.BuyPrice = req.BuyPrice
+	}
+	if req.BuyPriceHigh != nil {
+		plan.BuyPriceHigh = req.BuyPriceHigh
+	}
+	if req.TargetPrice != nil {
+		plan.TargetPrice = req.TargetPrice
+	}
+	if req.StopLossPrice != nil {
+		plan.StopLossPrice = req.StopLossPrice
+	}
+	if req.PlannedVolume != nil {
+		plan.PlannedVolume = *req.PlannedVolume
+	}
+	if req.PlannedAmount != nil {
+		plan.PlannedAmount = req.PlannedAmount
+	}
+	if req.PositionRatio != nil {
+		plan.PositionRatio = req.PositionRatio
+	}
+	if req.BuyBatches != nil {
+		plan.BuyBatches = maxInt(1, *req.BuyBatches)
+	}
+	if req.Reason != nil {
+		plan.Reason = strings.TrimSpace(*req.Reason)
+	}
+	if req.Catalyst != nil {
+		plan.Catalyst = strings.TrimSpace(*req.Catalyst)
+	}
+	if req.TriggerConditions != nil {
+		plan.TriggerConditions = *req.TriggerConditions
+	}
 	if req.Status != nil {
 		plan.Status = model.BuyPlanStatus(*req.Status)
 		if plan.Status == model.BuyPlanStatusExecuted {
@@ -295,6 +346,142 @@ func (s *BuyPlanService) CheckTriggers(ctx context.Context, userID int64) ([]*Bu
 	return triggered, nil
 }
 
+// BacktestSmartPlan 使用腾讯日K回测给定建仓参数的历史表现。
+func (s *BuyPlanService) BacktestSmartPlan(ctx context.Context, req *SmartPlanBacktestRequest) (*SmartPlanBacktestResult, error) {
+	code := strings.ToUpper(strings.TrimSpace(req.StockCode))
+	if len(code) != 6 {
+		return nil, fmt.Errorf("stock_code 格式错误（应为 6 位数字）")
+	}
+	if req.BuyPrice <= 0 || req.BuyPriceHigh <= 0 || req.StopLoss <= 0 || req.TargetPrice <= 0 {
+		return nil, fmt.Errorf("回测参数必须为正数")
+	}
+	if req.BuyPriceHigh < req.BuyPrice {
+		return nil, fmt.Errorf("buy_price_high 必须大于等于 buy_price")
+	}
+	if req.StopLoss >= req.BuyPrice {
+		return nil, fmt.Errorf("stop_loss 必须低于 buy_price")
+	}
+	if req.TargetPrice <= req.BuyPrice {
+		return nil, fmt.Errorf("target_price 必须高于 buy_price")
+	}
+
+	lookahead := req.LookaheadDays
+	if lookahead <= 0 || lookahead > 60 {
+		lookahead = 20
+	}
+	sampleDays := req.SampleDays
+	if sampleDays <= 0 || sampleDays > 360 {
+		sampleDays = 120
+	}
+
+	needBars := sampleDays + lookahead + 30
+	klineResp, err := s.stockSvc.GetKLine(code, needBars)
+	if err != nil {
+		return nil, fmt.Errorf("获取腾讯K线失败: %w", err)
+	}
+	klines := klineResp.KLines
+	if len(klines) < lookahead+30 {
+		return nil, fmt.Errorf("K线样本不足，至少需要 %d 根，当前 %d", lookahead+30, len(klines))
+	}
+
+	start := 30
+	end := len(klines) - lookahead
+	if end <= start {
+		return nil, fmt.Errorf("有效回测区间不足")
+	}
+	if max := start + sampleDays; max < end {
+		start = end - sampleDays
+	}
+
+	total := 0
+	triggered := 0
+	win := 0
+	loss := 0
+	timeout := 0
+	retSum := 0.0
+	holdSum := 0.0
+	profitSum := 0.0
+	lossSum := 0.0
+	returns := make([]float64, 0, end-start)
+
+	for i := start; i < end; i++ {
+		total++
+		bar := klines[i]
+		if !isPlanTriggeredInBar(bar, req.BuyPrice, req.BuyPriceHigh) {
+			continue
+		}
+		triggered++
+
+		outcomeRet := 0.0
+		outcomeHold := float64(lookahead)
+		outcomeType := "timeout"
+
+		for j := i + 1; j <= i+lookahead && j < len(klines); j++ {
+			next := klines[j]
+			if next.Low <= req.StopLoss {
+				outcomeRet = (req.StopLoss - req.BuyPrice) / req.BuyPrice * 100
+				outcomeHold = float64(j - i)
+				outcomeType = "loss"
+				break
+			}
+			if next.High >= req.TargetPrice {
+				outcomeRet = (req.TargetPrice - req.BuyPrice) / req.BuyPrice * 100
+				outcomeHold = float64(j - i)
+				outcomeType = "win"
+				break
+			}
+		}
+
+		if outcomeType == "timeout" {
+			last := klines[minInt(i+lookahead, len(klines)-1)]
+			outcomeRet = (last.Close - req.BuyPrice) / req.BuyPrice * 100
+		}
+
+		retSum += outcomeRet
+		holdSum += outcomeHold
+		returns = append(returns, outcomeRet)
+		if outcomeRet > 0 {
+			profitSum += outcomeRet
+		} else if outcomeRet < 0 {
+			lossSum += -outcomeRet
+		}
+
+		switch outcomeType {
+		case "win":
+			win++
+		case "loss":
+			loss++
+		default:
+			timeout++
+		}
+	}
+
+	res := &SmartPlanBacktestResult{
+		StockCode:        code,
+		SampleDays:       sampleDays,
+		LookaheadDays:    lookahead,
+		TotalSamples:     total,
+		TriggeredSamples: triggered,
+		WinSamples:       win,
+		LossSamples:      loss,
+		TimeoutSamples:   timeout,
+	}
+
+	if total > 0 {
+		res.TriggerRatePct = round2(float64(triggered) / float64(total) * 100)
+	}
+	if triggered > 0 {
+		res.WinRatePct = round2(float64(win) / float64(triggered) * 100)
+		res.AvgReturnPct = round2(retSum / float64(triggered))
+		res.AvgHoldDays = round2(holdSum / float64(triggered))
+		res.MedianReturnPct = round2(calcMedian(returns))
+		if lossSum > 0 {
+			res.ProfitFactor = round2(profitSum / lossSum)
+		}
+	}
+	return res, nil
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 内部工具
 // ═══════════════════════════════════════════════════════════════
@@ -371,4 +558,28 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func isPlanTriggeredInBar(k KLine, buy, buyHigh float64) bool {
+	return k.Low <= buyHigh && k.High >= buy
+}
+
+func calcMedian(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), values...)
+	sort.Float64s(cp)
+	mid := len(cp) / 2
+	if len(cp)%2 == 1 {
+		return cp[mid]
+	}
+	return (cp[mid-1] + cp[mid]) / 2
 }

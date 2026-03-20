@@ -38,7 +38,7 @@ const (
 	//   东财 push2 服务器 Keep-Alive 约 20s，设 15s 确保客户端主动淘汰
 	//   避免拿到已被服务器关闭的 stale 连接导致 EOF
 	emMaxIdleConns        = 100
-	emMaxIdleConnsPerHost = 10  // 降低单 host 空闲连接数，减少 stale 连接积压
+	emMaxIdleConnsPerHost = 10 // 降低单 host 空闲连接数，减少 stale 连接积压
 	emMaxConnsPerHost     = 30
 	emIdleConnTimeout     = 15 * time.Second // ★ 从 30s 降到 15s，核心修复
 
@@ -78,7 +78,7 @@ func GetEMHTTPClient() *EMHTTPClient {
 			MaxIdleConns:        emMaxIdleConns,
 			MaxIdleConnsPerHost: emMaxIdleConnsPerHost, // ★ 已降至 10
 			MaxConnsPerHost:     emMaxConnsPerHost,
-			IdleConnTimeout:     emIdleConnTimeout,     // ★ 已降至 15s
+			IdleConnTimeout:     emIdleConnTimeout, // ★ 已降至 15s
 			DialContext: (&net.Dialer{
 				Timeout:   emDialTimeout,
 				KeepAlive: emTCPKeepAlive,
@@ -178,9 +178,19 @@ type EMRequestOption struct {
 // resty 在函数返回前已完成全部 IO（包括 gzip 解压），
 // 不存在原生 net/http defer cancel 导致 context canceled 的问题。
 func (c *EMHTTPClient) FetchBody(ctx context.Context, url string, opt *EMRequestOption) ([]byte, error) {
-	req, cancel := c.buildRequest(ctx, opt)
-	defer cancel()
-	resp, err := req.Get(url)
+	resp, err := c.fetchBodyOnce(ctx, url, opt)
+	if err != nil && isEOFLikeError(err) {
+		if globalTM != nil {
+			_ = ForceRefreshCookie()
+		}
+		retryOpt := cloneEMRequestOption(opt)
+		if retryOpt.Headers == nil {
+			retryOpt.Headers = make(map[string]string, 1)
+		}
+		// EOF 常见于复用到已失效的 keep-alive 连接；兜底改为新连接再试一次。
+		retryOpt.Headers["Connection"] = "close"
+		resp, err = c.fetchBodyOnce(ctx, url, retryOpt)
+	}
 	if err != nil {
 		if c.log != nil {
 			c.log.Error("em_http: request failed",
@@ -211,6 +221,12 @@ func (c *EMHTTPClient) FetchBody(ctx context.Context, url string, opt *EMRequest
 	}
 
 	return body, nil
+}
+
+func (c *EMHTTPClient) fetchBodyOnce(ctx context.Context, url string, opt *EMRequestOption) (*resty.Response, error) {
+	req, cancel := c.buildRequest(ctx, opt)
+	defer cancel()
+	return req.Get(url)
 }
 
 // buildRequest 构造 resty.Request，注入 per-request 级别的配置。
@@ -296,6 +312,30 @@ func isRetryableError(errMsg string) bool {
 		}
 	}
 	return false
+}
+
+func isEOFLikeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "eof") ||
+		strings.Contains(lower, "closed network connection") ||
+		strings.Contains(lower, "transport connection broken")
+}
+
+func cloneEMRequestOption(opt *EMRequestOption) *EMRequestOption {
+	if opt == nil {
+		return &EMRequestOption{}
+	}
+	cloned := *opt
+	if opt.Headers != nil {
+		cloned.Headers = make(map[string]string, len(opt.Headers))
+		for k, v := range opt.Headers {
+			cloned.Headers[k] = v
+		}
+	}
+	return &cloned
 }
 
 // truncateURL 截断 URL 用于日志

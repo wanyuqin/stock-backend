@@ -123,3 +123,37 @@ func (h *RiskHandler) UpdateTodayRiskTodoStatus(c *gin.Context) {
 	}
 	OK(c, gin.H{"success": true})
 }
+
+func (h *RiskHandler) GenerateLowHealthTodo(c *gin.Context) {
+	var req service.GenerateLowHealthTodoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		BadRequest(c, "参数错误: "+err.Error())
+		return
+	}
+	res, err := h.svc.GenerateLowHealthTodo(c.Request.Context(), defaultUserID, &req)
+	if err != nil {
+		BadRequest(c, err.Error())
+		return
+	}
+	OK(c, res)
+}
+
+func (h *RiskHandler) GetWeeklyReview(c *gin.Context) {
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
+	res, err := h.svc.GetWeeklyReview(c.Request.Context(), defaultUserID, days)
+	if err != nil {
+		InternalError(c, err.Error())
+		return
+	}
+	OK(c, res)
+}
+
+func (h *RiskHandler) GetHealthTrend(c *gin.Context) {
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
+	res, err := h.svc.GetHealthTrend(c.Request.Context(), defaultUserID, days)
+	if err != nil {
+		InternalError(c, err.Error())
+		return
+	}
+	OK(c, res)
+}

@@ -29,6 +29,10 @@ type Config struct {
 	// ── CORS ──────────────────────────────
 	// 多个源用逗号分隔，例如 "http://localhost:5173,https://yourapp.com"
 	CORSAllowedOrigins string
+
+	// ── 行情数据源 ──────────────────────────
+	// qq | em
+	MarketDataSourceDefault string
 }
 
 // DSN 返回 PostgreSQL 连接字符串（pgx / sqlx 通用格式）
@@ -58,7 +62,8 @@ func Load() (*Config, error) {
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 
-		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:5173"),
+		CORSAllowedOrigins:      getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:5173"),
+		MarketDataSourceDefault: getEnv("MARKET_DATA_SOURCE_DEFAULT", "qq"),
 	}
 
 	if err := cfg.validate(); err != nil {

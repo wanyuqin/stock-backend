@@ -36,15 +36,16 @@ type MorningBriefDTO struct {
 }
 
 type MorningBriefService struct {
-	marketSvc    *MarketSentinelService
-	guardianSvc  *PositionGuardianService
-	reportSvc    *StockReportService
-	valSvc       *ValuationService
-	dividendSvc  *DividendCalendarService // 分红除权
-	buyPlanRepo  repo.BuyPlanRepo
+	marketSvc     *MarketSentinelService
+	guardianSvc   *PositionGuardianService
+	reportSvc     *StockReportService
+	valSvc        *ValuationService
+	dividendSvc   *DividendCalendarService
+	newsAnalyzer  *NewsSentimentAnalyzer // ★ 新增
+	buyPlanRepo   repo.BuyPlanRepo
 	watchlistRepo repo.WatchlistRepo
-	aiSvc        *AIAnalysisService
-	log          *zap.Logger
+	aiSvc         *AIAnalysisService
+	log           *zap.Logger
 
 	mu         sync.RWMutex
 	cachedDate string
@@ -67,6 +68,7 @@ func NewMorningBriefService(
 		reportSvc:     reportSvc,
 		valSvc:        valSvc,
 		dividendSvc:   NewDividendCalendarService(log),
+		newsAnalyzer:  NewNewsSentimentAnalyzer(aiSvc, buyPlanRepo, guardianSvc.posRepo, log),
 		buyPlanRepo:   buyPlanRepo,
 		watchlistRepo: watchlistRepo,
 		aiSvc:         aiSvc,
@@ -128,14 +130,14 @@ func (s *MorningBriefService) generateAICommentAsync(brief *MorningBriefDTO) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// build — 并发拉取各数据源
+// build — 并发拉取各数据源（新增 Section 5：新闻情绪）
 // ─────────────────────────────────────────────────────────────────
 
 func (s *MorningBriefService) build(ctx context.Context, userID int64, today string) (*MorningBriefDTO, error) {
 	brief := &MorningBriefDTO{
 		Date:        today,
 		GeneratedAt: time.Now(),
-		Sections:    make([]MorningBriefSection, 5),
+		Sections:    make([]MorningBriefSection, 6), // 6 个 section
 		AIPending:   s.aiSvc.apiKey != "",
 	}
 
@@ -149,14 +151,15 @@ func (s *MorningBriefService) build(ctx context.Context, userID int64, today str
 		section MorningBriefSection
 		idx     int
 	}
-	ch := make(chan result, 4)
+	ch := make(chan result, 5)
 
 	go func() { ch <- result{s.buildPositionSection(ctx), 1} }()
 	go func() { ch <- result{s.buildBuyPlanSection(ctx, userID), 2} }()
 	go func() { ch <- result{s.buildReportSection(ctx), 3} }()
 	go func() { ch <- result{s.buildValuationSection(ctx, userID), 4} }()
+	go func() { ch <- result{s.buildNewsSection(ctx, userID), 5} }() // ★ 新闻情绪
 
-	for range [4]struct{}{} {
+	for range [5]struct{}{} {
 		r := <-ch
 		brief.Sections[r.idx] = r.section
 	}
@@ -165,7 +168,106 @@ func (s *MorningBriefService) build(ctx context.Context, userID int64, today str
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Section 构建
+// buildNewsSection — 财联社新闻情绪分析
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MorningBriefService) buildNewsSection(ctx context.Context, userID int64) MorningBriefSection {
+	sec := MorningBriefSection{Title: "新闻情绪", Level: "normal"}
+
+	// 给新闻分析一个单独的超时（最多 30s，不阻断其他 section）
+	newsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	result, err := s.newsAnalyzer.Analyze(newsCtx, userID)
+	if err != nil {
+		s.log.Warn("morning brief: news analysis failed", zap.Error(err))
+		sec.Items = []string{"财联社电报暂时无法获取，请稍后刷新"}
+		return sec
+	}
+
+	// 情绪概览行
+	sentimentIcon := "🟡"
+	switch result.MarketSentiment {
+	case "偏多", "略偏多":
+		sentimentIcon = "🟢"
+		sec.Level = "info"
+	case "偏空", "略偏空":
+		sentimentIcon = "🔴"
+		sec.Level = "warning"
+	}
+
+	sec.Items = append(sec.Items, fmt.Sprintf(
+		"%s 财联社 %d 条电报 | 利好 %d 利空 %d 中性 %d | 综合情绪：%s",
+		sentimentIcon,
+		result.TotalNews,
+		result.BullishCount,
+		result.BearishCount,
+		result.NeutralCount,
+		result.MarketSentiment,
+	))
+
+	// 与持仓/买入计划有关联的新闻（最重要，放最前）
+	if len(result.LinkedItems) > 0 {
+		sec.Items = append(sec.Items, "── 关联你的持仓/计划 ──────────────")
+		for _, item := range result.LinkedItems {
+			for _, hint := range item.ActionHints {
+				sec.Items = append(sec.Items, hint)
+			}
+		}
+		// 有关联且有利空，升级警告级别
+		for _, item := range result.LinkedItems {
+			if item.Score < 0 {
+				sec.Level = "warning"
+				break
+			}
+		}
+	}
+
+	// 重要新闻摘要（A 级 + 有评分的 B 级，最多 5 条）
+	importantShown := 0
+	headerAdded := false
+	for _, item := range result.Items {
+		if importantShown >= 5 {
+			break
+		}
+		if item.Level != "A" && (item.Level == "B" && item.Score == 0) {
+			continue
+		}
+		if len(item.AffectedCodes) > 0 {
+			continue // 已在上面的关联区显示
+		}
+		if !headerAdded {
+			sec.Items = append(sec.Items, "── 重要电报 ──────────────────────")
+			headerAdded = true
+		}
+		scoreIcon := "⬜"
+		switch item.Score {
+		case 1:
+			scoreIcon = "🟢"
+		case -1:
+			scoreIcon = "🔴"
+		}
+		content := item.Content
+		if len([]rune(content)) > 80 {
+			content = string([]rune(content)[:80]) + "…"
+		}
+		line := fmt.Sprintf("%s [%s] %s", scoreIcon, item.Level, content)
+		if item.Reason != "" {
+			line += fmt.Sprintf("（%s）", item.Reason)
+		}
+		sec.Items = append(sec.Items, line)
+		importantShown++
+	}
+
+	if len(sec.Items) == 1 {
+		sec.Items = append(sec.Items, "暂无重要电报")
+	}
+
+	return sec
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 原有 Section 构建（保持不变）
 // ─────────────────────────────────────────────────────────────────
 
 func (s *MorningBriefService) buildMarketSection(ctx context.Context) (MorningBriefSection, string, int, string) {
@@ -201,7 +303,6 @@ func (s *MorningBriefService) buildMarketSection(ctx context.Context) (MorningBr
 	return sec, summary.AlertStatus, summary.SentimentScore, summary.DailySummary
 }
 
-// buildPositionSection 持仓预警，含分红除权提示
 func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningBriefSection {
 	sec := MorningBriefSection{Title: "持仓预警", Level: "normal"}
 
@@ -211,18 +312,13 @@ func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningB
 		return sec
 	}
 
-	// 收集持仓股代码，用于查询分红
 	holdCodes := make([]string, 0, len(results))
 	for _, r := range results {
 		holdCodes = append(holdCodes, r.StockCode)
 	}
-
-	// 并发查询分红（最多等 5s，失败不阻断主流程）
 	divCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	dividends, _ := s.dividendSvc.GetUpcomingDividends(divCtx, holdCodes)
-
-	// 建立 code → dividend 映射（只取最近一条）
 	divMap := make(map[string]*DividendEvent)
 	for _, d := range dividends {
 		if _, exists := divMap[d.StockCode]; !exists {
@@ -231,13 +327,10 @@ func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningB
 	}
 
 	var stopItems, sellItems, tItems, holdItems []string
-
 	for _, r := range results {
 		pnlStr   := fmt.Sprintf("%+.1f%%", r.Snapshot.PnLPct*100)
 		priceStr := fmt.Sprintf("¥%.2f", r.Snapshot.Price)
 		base     := fmt.Sprintf("%s（%s）现价 %s，盈亏 %s", r.StockName, r.StockCode, priceStr, pnlStr)
-
-		// 分红除权提示后缀
 		divSuffix := ""
 		if div, ok := divMap[r.StockCode]; ok {
 			switch div.DaysUntil {
@@ -249,7 +342,6 @@ func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningB
 				divSuffix = fmt.Sprintf(" 📅【%d天后除权：%s】", div.DaysUntil, div.PlanDesc)
 			}
 		}
-
 		switch r.Signal {
 		case model.SignalStopLoss:
 			stopItems = append(stopItems, fmt.Sprintf("🛑 %s — 触发止损，建议立即执行%s", base, divSuffix))
@@ -271,12 +363,10 @@ func (s *MorningBriefService) buildPositionSection(ctx context.Context) MorningB
 	} else if len(sellItems) > 0 {
 		sec.Level = "warning"
 	}
-
 	sec.Items = append(sec.Items, stopItems...)
 	sec.Items = append(sec.Items, sellItems...)
 	sec.Items = append(sec.Items, tItems...)
 	sec.Items = append(sec.Items, holdItems...)
-
 	if len(sec.Items) == 0 {
 		sec.Items = []string{"持仓正常，无需特别操作"}
 	}
@@ -303,7 +393,6 @@ func (s *MorningBriefService) buildBuyPlanSection(ctx context.Context, userID in
 		if p.TargetPrice != nil {
 			tgtStr = fmt.Sprintf("¥%.2f", *p.TargetPrice)
 		}
-
 		if p.Status == model.BuyPlanStatusReady {
 			triggeredCount++
 			item := fmt.Sprintf("🎯 %s（%s）已到达买入价 %s → 目标 %s", p.StockName, p.StockCode, buyStr, tgtStr)
@@ -316,7 +405,6 @@ func (s *MorningBriefService) buildBuyPlanSection(ctx context.Context, userID in
 				fmt.Sprintf("👀 %s（%s）观察中，买入价 %s，目标 %s", p.StockName, p.StockCode, buyStr, tgtStr))
 		}
 	}
-
 	if triggeredCount > 0 {
 		sec.Level = "info"
 		sec.Items = append([]string{
@@ -328,16 +416,13 @@ func (s *MorningBriefService) buildBuyPlanSection(ctx context.Context, userID in
 
 func (s *MorningBriefService) buildReportSection(ctx context.Context) MorningBriefSection {
 	sec := MorningBriefSection{Title: "研报速递", Level: "normal"}
-
 	page, err := s.reportSvc.GetReports(ctx, repo.StockReportQuery{Page: 1, Limit: 5})
 	if err != nil || page == nil || len(page.Items) == 0 {
 		sec.Items = []string{"暂无最新研报"}
 		return sec
 	}
-
 	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 	todayStr  := time.Now().Format("2006-01-02")
-
 	for _, r := range page.Items {
 		dateStr := r.PublishDate.Format("2006-01-02")
 		if dateStr != todayStr && dateStr != yesterday {
@@ -353,7 +438,6 @@ func (s *MorningBriefService) buildReportSection(ctx context.Context) MorningBri
 		sec.Items = append(sec.Items,
 			fmt.Sprintf("📋 %s（%s）%s — %s [%s]", r.StockName, r.StockCode, r.RatingName, summary, r.OrgSName))
 	}
-
 	if len(sec.Items) == 0 {
 		sec.Items = []string{"今日暂无新研报"}
 	}
@@ -362,18 +446,15 @@ func (s *MorningBriefService) buildReportSection(ctx context.Context) MorningBri
 
 func (s *MorningBriefService) buildValuationSection(ctx context.Context, userID int64) MorningBriefSection {
 	sec := MorningBriefSection{Title: "估值机会", Level: "normal"}
-
 	summary, err := s.valSvc.GetWatchlistSummary(ctx, userID)
 	if err != nil || summary == nil || summary.Total == 0 {
 		sec.Items = []string{"自选股估值数据暂缺，可手动触发同步"}
 		return sec
 	}
-
 	sec.Items = append(sec.Items, fmt.Sprintf(
 		"自选股共 %d 只：低估 %d | 合理 %d | 高估 %d | 积累中 %d",
 		summary.Total, summary.Undervalued, summary.Normal, summary.Overvalued, summary.Unknown,
 	))
-
 	undervaluedStocks := make([]string, 0, 3)
 	for _, item := range summary.Items {
 		if item.Status == StatusUndervalued && item.PEPercentile != nil {
@@ -388,7 +469,6 @@ func (s *MorningBriefService) buildValuationSection(ctx context.Context, userID 
 		sec.Level = "info"
 		sec.Items = append(sec.Items, "低估标的："+strings.Join(undervaluedStocks, " | "))
 	}
-
 	overvaluedNames := make([]string, 0, 3)
 	for _, item := range summary.Items {
 		if item.Status == StatusOvervalued {
@@ -408,7 +488,6 @@ func (s *MorningBriefService) buildAIComment(ctx context.Context, brief *Morning
 	if s.aiSvc.apiKey == "" {
 		return ""
 	}
-
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("今日（%s）A股开盘前简报：\n", brief.Date))
 	sb.WriteString(fmt.Sprintf("大盘情绪：%s，热度 %d/100。%s\n", brief.MarketMood, brief.MoodScore, brief.MoodSummary))
@@ -422,7 +501,6 @@ func (s *MorningBriefService) buildAIComment(ctx context.Context, brief *Morning
 		}
 	}
 	prompt := sb.String() + "\n请用 3-4 句话给出今日操作的核心建议，语气专业简练，不超过 150 字。"
-
 	comment, err := s.aiSvc.callEino(ctx, prompt)
 	if err != nil {
 		s.log.Warn("morning brief: AI comment failed", zap.Error(err))

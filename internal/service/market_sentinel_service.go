@@ -2,11 +2,10 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,67 +14,94 @@ import (
 	"stock-backend/internal/repo"
 )
 
-const (
-	emUlistURL = "https://push2.eastmoney.com/api/qt/ulist.np/get" +
-		"?fltt=2&invt=2" +
-		"&fields=f12,f14,f3,f5,f6,f104,f105,f106,f134" +
-		"&secids=1.000001,0.399001" +
-		"&ut=bd1d9ddb04089700cf9c27f6f7426281"
+// ═══════════════════════════════════════════════════════════════
+// market_sentinel_service.go
+//
+// 数据来源（全部腾讯 qt.gtimg.cn，不依赖东财接口）：
+//
+//   主力：bkqtRank_A_sh + bkqtRank_A_sz
+//         板块排行接口，直接给出真实的沪深涨跌家数、涨停数、成交额
+//         字段布局：
+//           [2]  上涨家数
+//           [3]  涨停家数
+//           [4]  下跌家数
+//           [5]  本市场股票总数
+//           [9]  成交量（手）
+//           [10] 成交额（万元）
+//           [11] 涨幅最大股票代码
+//           [12] 涨幅最小股票代码
+//
+//   备用：sh000001 + sz399001（指数行情，仅用于估算）
+//
+// 实时性设计：
+//   - GetSummary 每次都拉实时数据（腾讯接口极快，<200ms）
+//   - 内存缓存 5 秒，避免同一秒内多次请求打穿接口
+//   - 数据库 Upsert 保留，每分钟后台写入（供历史均量计算）
+// ═══════════════════════════════════════════════════════════════
 
-	emDatacenterURL = "https://datacenter-web.eastmoney.com/api/data/v1/get" +
-		"?reportName=RPT_STOCK_CHANGE_STATISTICS" +
-		"&columns=TRADE_DATE,RISE_NUM,DOWN_NUM" +
-		"&pageNumber=1&pageSize=1" +
-		"&sortColumns=TRADE_DATE&sortTypes=-1"
+const (
+	// 腾讯 bkqtRank — 全市场板块排行（沪/深分开，数据最准）
+	qqBkRankURL = "https://qt.gtimg.cn/q=bkqtRank_A_sh,bkqtRank_A_sz"
+
+	// 腾讯指数行情（备用）
+	qqIndexURL = "https://qt.gtimg.cn/q=sh000001,sz399001"
+
+	// GetSummary 实时数据内存缓存 TTL
+	summaryCacheTTL = 5 * time.Second
 )
 
-type ulistResponse struct {
-	RC   int    `json:"rc"`
-	Data *struct {
-		Total int         `json:"total"`
-		Diff  []ulistItem `json:"diff"`
-	} `json:"data"`
+// ─────────────────────────────────────────────────────────────────
+// 内存缓存（5 秒）
+// ─────────────────────────────────────────────────────────────────
+
+type summaryCache struct {
+	mu        sync.RWMutex
+	data      *MarketSummaryDTO
+	fetchedAt time.Time
 }
 
-type ulistItem struct {
-	Code    string  `json:"f12"`
-	Name    string  `json:"f14"`
-	ChgPct  float64 `json:"f3"`
-	Volume  float64 `json:"f5"`
-	Amount  float64 `json:"f6"`
-	UpCount int     `json:"f104"`
-	DnCount int     `json:"f105"`
-	FlCount int     `json:"f106"`
-	LimitUp int     `json:"f134"`
+func (c *summaryCache) get() (*MarketSummaryDTO, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.data == nil || time.Since(c.fetchedAt) > summaryCacheTTL {
+		return nil, false
+	}
+	cp := *c.data
+	return &cp, true
 }
 
-type datacenterResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Result  *struct {
-		Pages int `json:"pages"`
-		Count int `json:"count"`
-		Data  []struct {
-			TradeDate string `json:"TRADE_DATE"`
-			RiseNum   int    `json:"RISE_NUM"`
-			DownNum   int    `json:"DOWN_NUM"`
-		} `json:"data"`
-	} `json:"result"`
+func (c *summaryCache) set(d *MarketSummaryDTO) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := *d
+	c.data = &cp
+	c.fetchedAt = time.Now()
 }
+
+// ─────────────────────────────────────────────────────────────────
+// 服务结构
+// ─────────────────────────────────────────────────────────────────
 
 type MarketSentinelService struct {
-	repo       repo.MarketSentimentRepo
-	httpClient *http.Client
-	log        *zap.Logger
+	repo                repo.MarketSentimentRepo
+	defaultMarketSource string
+	cache               summaryCache
+	log                 *zap.Logger
 }
 
-func NewMarketSentinelService(r repo.MarketSentimentRepo, log *zap.Logger) *MarketSentinelService {
+func NewMarketSentinelService(r repo.MarketSentimentRepo, defaultMarketSource string, log *zap.Logger) *MarketSentinelService {
 	return &MarketSentinelService{
-		repo:       r,
-		httpClient: newEMClient(15 * time.Second),
-		log:        log,
+		repo:                r,
+		defaultMarketSource: normalizeMarketSource(defaultMarketSource),
+		log:                 log,
 	}
 }
+
+func (s *MarketSentinelService) DefaultMarketSource() string { return s.defaultMarketSource }
+
+// ─────────────────────────────────────────────────────────────────
+// DTO
+// ─────────────────────────────────────────────────────────────────
 
 type MarketSummaryDTO struct {
 	SentimentScore int     `json:"sentiment_score"`
@@ -86,12 +112,15 @@ type MarketSummaryDTO struct {
 	DownCount      int     `json:"down_count"`
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Start — 后台定时任务（每分钟写库，供历史均量使用）
+// ─────────────────────────────────────────────────────────────────
+
 func (s *MarketSentinelService) Start(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	go func() {
-		if err := s.RunAnalysis(ctx); err != nil {
-			s.log.Error("market sentinel: initial run failed", zap.Error(err))
-		}
+		// 启动时立即写一次
+		s.persistToDB(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -100,62 +129,100 @@ func (s *MarketSentinelService) Start(ctx context.Context) {
 			case <-ticker.C:
 				now := time.Now()
 				if now.Hour() >= 9 && (now.Hour() < 15 || (now.Hour() == 15 && now.Minute() <= 30)) {
-					if err := s.RunAnalysis(ctx); err != nil {
-						s.log.Error("market sentinel: run failed", zap.Error(err))
-					}
+					s.persistToDB(ctx)
 				}
 			}
 		}
 	}()
 }
 
-func (s *MarketSentinelService) RunAnalysis(ctx context.Context) error {
-	marketData, err := s.fetchMarketData()
+// persistToDB 抓取实时数据写入数据库（后台调用，不影响接口响应速度）
+func (s *MarketSentinelService) persistToDB(ctx context.Context) {
+	ms, err := s.fetchMarketData(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch market data: %w", err)
+		s.log.Warn("market sentinel: fetchMarketData for DB failed", zap.Error(err))
+		return
 	}
 	avgVol := s.getAverageVolume(ctx, 5)
 	if avgVol == 0 {
-		avgVol = marketData.TotalAmount
+		avgVol = ms.TotalAmount
 	}
-	marketData.SentimentScore = s.calculateScore(marketData, avgVol)
-	if err := s.repo.Upsert(ctx, marketData); err != nil {
-		return fmt.Errorf("save market sentiment: %w", err)
+	ms.SentimentScore = s.calculateScore(ms, avgVol)
+	if err := s.repo.Upsert(ctx, ms); err != nil {
+		s.log.Warn("market sentinel: db upsert failed", zap.Error(err))
+		return
 	}
-	s.log.Info("market sentinel: analysis completed",
-		zap.Int("score", marketData.SentimentScore),
-		zap.Float64("amount_bn", marketData.TotalAmount/1e9),
-		zap.Int("up", marketData.UpCount),
-		zap.Int("down", marketData.DownCount),
+	s.log.Info("market sentinel: db persisted",
+		zap.Int("score", ms.SentimentScore),
+		zap.Float64("amount_100m", ms.TotalAmount/1e8),
+		zap.Int("up", ms.UpCount),
+		zap.Int("down", ms.DownCount),
 	)
+}
+
+// RunAnalysis / RunAnalysisBySource 保留兼容接口（供 cron/admin 调用）
+func (s *MarketSentinelService) RunAnalysis(ctx context.Context) error {
+	return s.RunAnalysisBySource(ctx, s.defaultMarketSource)
+}
+
+func (s *MarketSentinelService) RunAnalysisBySource(ctx context.Context, _ string) error {
+	s.persistToDB(ctx)
 	return nil
 }
 
+// ─────────────────────────────────────────────────────────────────
+// GetSummary — 实时拉取，5 秒内存缓存
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) GetSummaryBySource(ctx context.Context, _ string) (*MarketSummaryDTO, error) {
+	return s.GetSummary(ctx)
+}
+
 func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryDTO, error) {
-	today := time.Now().Truncate(24 * time.Hour)
-	m, err := s.repo.GetByDate(ctx, today)
-	if err != nil {
-		s.log.Info("market data missing for today, triggering on-demand analysis")
-		if runErr := s.RunAnalysis(ctx); runErr == nil {
-			m, err = s.repo.GetByDate(ctx, today)
-		} else {
-			s.log.Warn("on-demand analysis failed", zap.Error(runErr))
-		}
-	}
-	if err != nil || m == nil {
-		m, err = s.repo.GetLatest(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("no market data available: %w", err)
-		}
-	}
-	if m == nil {
-		return nil, fmt.Errorf("no market data available")
+	// 命中内存缓存（5s 内）
+	if cached, ok := s.cache.get(); ok {
+		return cached, nil
 	}
 
+	ms, err := s.fetchMarketData(ctx)
+	if err != nil {
+		// 实时拉取失败，降级读数据库最新一条
+		s.log.Warn("market sentinel: live fetch failed, falling back to DB", zap.Error(err))
+		return s.buildSummaryFromDB(ctx)
+	}
+
+	// 计算热度分（需要历史均量）
+	avgVol := s.getAverageVolume(ctx, 5)
+	if avgVol == 0 {
+		avgVol = ms.TotalAmount
+	}
+	ms.SentimentScore = s.calculateScore(ms, avgVol)
+
+	dto := s.buildSummaryDTO(ms)
+	s.cache.set(dto)
+	return dto, nil
+}
+
+// buildSummaryFromDB 降级：读数据库最新一条
+func (s *MarketSentinelService) buildSummaryFromDB(ctx context.Context) (*MarketSummaryDTO, error) {
+	today := time.Now().Truncate(24 * time.Hour)
+	m, err := s.repo.GetByDate(ctx, today)
+	if err != nil || m == nil {
+		m, err = s.repo.GetLatest(ctx)
+		if err != nil || m == nil {
+			return nil, fmt.Errorf("no market data available")
+		}
+	}
+	return s.buildSummaryDTO(m), nil
+}
+
+// buildSummaryDTO model → DTO，统一构建逻辑
+func (s *MarketSentinelService) buildSummaryDTO(m *model.MarketSentiment) *MarketSummaryDTO {
 	alertStatus := "SAFE"
-	if m.LimitDownCount > 20 || m.SentimentScore < 30 {
+	switch {
+	case m.LimitDownCount > 20 || m.SentimentScore < 30:
 		alertStatus = "DANGER"
-	} else if m.SentimentScore < 50 {
+	case m.SentimentScore < 50:
 		alertStatus = "WARNING"
 	}
 
@@ -166,7 +233,7 @@ func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryD
 		summary += " 市场极寒，请注意风险！"
 	case alertStatus == "SAFE" && m.SentimentScore > 70:
 		summary += " 市场火热，进攻！"
-	case m.TotalAmount < 700e9:
+	case m.TotalAmount > 0 && m.TotalAmount < 700e9:
 		summary += " 存量博弈，赚钱效应较弱。"
 	}
 
@@ -177,124 +244,188 @@ func (s *MarketSentinelService) GetSummary(ctx context.Context) (*MarketSummaryD
 		DailySummary:   summary,
 		UpCount:        m.UpCount,
 		DownCount:      m.DownCount,
-	}, nil
+	}
 }
 
-func (s *MarketSentinelService) fetchMarketData() (*model.MarketSentiment, error) {
-	ms, err := s.fetchFromUlist()
-	if err != nil {
-		s.log.Warn("market sentinel: ulist fetch failed, falling back to datacenter", zap.Error(err))
-		return s.fetchFromDatacenter()
+// ─────────────────────────────────────────────────────────────────
+// fetchMarketData — 优先 bkqtRank，失败退回指数估算
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) fetchMarketData(ctx context.Context) (*model.MarketSentiment, error) {
+	ms, err := s.fetchFromBkRank(ctx)
+	if err == nil {
+		return ms, nil
 	}
-	return ms, nil
+	s.log.Warn("market sentinel: bkqtRank failed, fallback to index estimate", zap.Error(err))
+	recordDataSourceFallback("market_summary", "qq_bkrank", "qq_index")
+	return s.fetchFromQQIndex(ctx)
 }
 
-func (s *MarketSentinelService) fetchFromUlist() (*model.MarketSentiment, error) {
-	body, err := s.get(emUlistURL)
+// ─────────────────────────────────────────────────────────────────
+// fetchFromBkRank — 腾讯 bkqtRank_A_sh/sz（最准确）
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) fetchFromBkRank(ctx context.Context) (*model.MarketSentiment, error) {
+	body, err := fetchQQHTTP(ctx, qqBkRankURL)
 	if err != nil {
-		return nil, fmt.Errorf("ulist http: %w", err)
-	}
-	var resp ulistResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("ulist unmarshal: %w | body: %.200s", err, body)
-	}
-	if resp.RC != 0 {
-		return nil, fmt.Errorf("ulist rc=%d", resp.RC)
-	}
-	if resp.Data == nil || len(resp.Data.Diff) == 0 {
-		return nil, fmt.Errorf("ulist: empty diff")
+		return nil, fmt.Errorf("bkqtRank http: %w", err)
 	}
 
-	ms := &model.MarketSentiment{TradeDate: time.Now().Truncate(24 * time.Hour)}
-	for _, item := range resp.Data.Diff {
-		ms.TotalAmount += item.Amount
-		ms.UpCount += item.UpCount
-		ms.DownCount += item.DnCount
-		ms.LimitUpCount += item.LimitUp
+	utf8Body, convErr := gbkToUTF8(body)
+	if convErr != nil {
+		utf8Body = body
 	}
-	if ms.TotalAmount == 0 || (ms.UpCount == 0 && ms.DownCount == 0) {
-		return nil, fmt.Errorf("ulist: zero data (market may be closed)")
+
+	var sh, sz []string
+	for _, line := range strings.Split(string(utf8Body), ";") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		start := strings.Index(line, `"`)
+		end := strings.LastIndex(line, `"`)
+		if start < 0 || end <= start {
+			continue
+		}
+		fields := strings.Split(line[start+1:end], "~")
+		if len(fields) < 11 {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "bkqtRank_A_sh"):
+			sh = fields
+		case strings.Contains(line, "bkqtRank_A_sz"):
+			sz = fields
+		}
 	}
-	s.log.Info("market sentinel: ulist fetch ok",
-		zap.Float64("amount_bn", ms.TotalAmount/1e9),
+
+	if sh == nil && sz == nil {
+		return nil, fmt.Errorf("bkqtRank: both sh and sz missing from response")
+	}
+
+	ms := &model.MarketSentiment{
+		TradeDate: time.Now().Truncate(24 * time.Hour),
+	}
+	if sh != nil {
+		ms.UpCount      += int(parseF(sh[2]))
+		ms.LimitUpCount += int(parseF(sh[3]))
+		ms.DownCount    += int(parseF(sh[4]))
+		ms.TotalAmount  += parseF(sh[10]) * 10000 // 万元 → 元
+	}
+	if sz != nil {
+		ms.UpCount      += int(parseF(sz[2]))
+		ms.LimitUpCount += int(parseF(sz[3]))
+		ms.DownCount    += int(parseF(sz[4]))
+		ms.TotalAmount  += parseF(sz[10]) * 10000 // 万元 → 元
+	}
+
+	if ms.UpCount == 0 && ms.DownCount == 0 {
+		return nil, fmt.Errorf("bkqtRank: zero up/down counts (market likely closed or pre-open)")
+	}
+
+	s.log.Debug("market sentinel: bkqtRank fetch ok",
+		zap.Float64("amount_100m", ms.TotalAmount/1e8),
 		zap.Int("up", ms.UpCount),
 		zap.Int("down", ms.DownCount),
+		zap.Int("limit_up", ms.LimitUpCount),
 	)
 	return ms, nil
 }
 
-func (s *MarketSentinelService) fetchFromDatacenter() (*model.MarketSentiment, error) {
-	body, err := s.get(emDatacenterURL)
+// ─────────────────────────────────────────────────────────────────
+// fetchFromQQIndex — 指数行情备用（家数为估算）
+// ─────────────────────────────────────────────────────────────────
+
+func (s *MarketSentinelService) fetchFromQQIndex(ctx context.Context) (*model.MarketSentiment, error) {
+	body, err := fetchQQHTTP(ctx, qqIndexURL)
 	if err != nil {
-		return nil, fmt.Errorf("datacenter http: %w", err)
+		return nil, fmt.Errorf("qq index http: %w", err)
 	}
-	var resp datacenterResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("datacenter unmarshal: %w | body: %.200s", err, body)
-	}
-	if !resp.Success || resp.Result == nil || len(resp.Result.Data) == 0 {
-		return nil, fmt.Errorf("datacenter: %s", resp.Message)
+	quotes, parseErr := parseQQQuoteBatch(body)
+	if parseErr != nil {
+		return nil, fmt.Errorf("qq index parse: %w", parseErr)
 	}
 
-	row := resp.Result.Data[0]
-	ms := &model.MarketSentiment{
-		TradeDate: time.Now().Truncate(24 * time.Hour),
-		UpCount:   row.RiseNum,
-		DownCount: row.DownNum,
+	// 按名称匹配，避免与同代码个股（000001 平安银行）冲突
+	var sh, sz *Quote
+	for _, q := range quotes {
+		if q == nil {
+			continue
+		}
+		if strings.Contains(q.Name, "上证") && sh == nil {
+			sh = q
+		} else if (strings.Contains(q.Name, "深证成") || strings.Contains(q.Name, "深成")) && sz == nil {
+			sz = q
+		}
 	}
-	if amount, err := s.fetchTotalAmount(); err == nil {
-		ms.TotalAmount = amount
+
+	if sh == nil && sz == nil {
+		return nil, fmt.Errorf("qq index: neither SH nor SZ index found")
 	}
-	if ms.UpCount == 0 && ms.DownCount == 0 {
-		return nil, fmt.Errorf("datacenter: zero up/down counts")
+
+	totalAmount := 0.0
+	weightedChange := 0.0
+	weights := 0.0
+	for _, q := range []*Quote{sh, sz} {
+		if q == nil {
+			continue
+		}
+		amtYuan := q.Amount * 10000
+		totalAmount += amtYuan
+		w := amtYuan
+		if w <= 0 {
+			w = 1
+		}
+		weightedChange += q.ChangeRate * w
+		weights += w
 	}
-	return ms, nil
+
+	marketChg := 0.0
+	if weights > 0 {
+		marketChg = weightedChange / weights
+	}
+
+	const totalStocks = 5200
+	upRatio := 0.5 + marketChg/10.0
+	if upRatio < 0.05 {
+		upRatio = 0.05
+	}
+	if upRatio > 0.95 {
+		upRatio = 0.95
+	}
+	upCount   := int(math.Round(upRatio * totalStocks))
+	downCount := totalStocks - upCount
+
+	limitUp, limitDown := 0, 0
+	switch {
+	case marketChg >= 2:
+		limitUp = 100
+	case marketChg >= 1:
+		limitUp = 50
+	case marketChg <= -2:
+		limitDown = 100
+	case marketChg <= -1:
+		limitDown = 50
+	}
+
+	s.log.Info("market sentinel: qq index fallback ok",
+		zap.Float64("market_chg", marketChg),
+		zap.Float64("amount_100m", totalAmount/1e8),
+	)
+
+	return &model.MarketSentiment{
+		TradeDate:      time.Now().Truncate(24 * time.Hour),
+		TotalAmount:    totalAmount,
+		UpCount:        upCount,
+		DownCount:      downCount,
+		LimitUpCount:   limitUp,
+		LimitDownCount: limitDown,
+	}, nil
 }
 
-func (s *MarketSentinelService) fetchTotalAmount() (float64, error) {
-	const amtURL = "https://push2.eastmoney.com/api/qt/ulist.np/get" +
-		"?fltt=2&invt=2&fields=f12,f6" +
-		"&secids=1.000001,0.399001" +
-		"&ut=bd1d9ddb04089700cf9c27f6f7426281"
-	body, err := s.get(amtURL)
-	if err != nil {
-		return 0, err
-	}
-	var resp ulistResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, err
-	}
-	if resp.RC != 0 || resp.Data == nil {
-		return 0, fmt.Errorf("rc=%d", resp.RC)
-	}
-	total := 0.0
-	for _, item := range resp.Data.Diff {
-		total += item.Amount
-	}
-	return total, nil
-}
-
-// get 通用 HTTP GET，带 Cookie + Chrome 请求头
-func (s *MarketSentinelService) get(url string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://quote.eastmoney.com/")
-	req.Header.Set("Accept", "*/*")
-	injectCookie(req) // ← 注入 Cookie
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
-}
+// ─────────────────────────────────────────────────────────────────
+// 辅助方法
+// ─────────────────────────────────────────────────────────────────
 
 func (s *MarketSentinelService) getAverageVolume(ctx context.Context, days int) float64 {
 	sum := 0.0
@@ -318,7 +449,9 @@ func (s *MarketSentinelService) calculateScore(m *model.MarketSentiment, avgVol 
 	if total == 0 {
 		return 50
 	}
+
 	upRatio := float64(m.UpCount) / total
+
 	limitUpRatio := 0.0
 	totalLimit := float64(m.LimitUpCount + m.LimitDownCount)
 	if totalLimit > 0 {
@@ -326,8 +459,9 @@ func (s *MarketSentinelService) calculateScore(m *model.MarketSentiment, avgVol 
 	} else if m.LimitUpCount > 0 {
 		limitUpRatio = 1.0
 	}
+
 	volRatio := 1.0
-	if avgVol > 0 {
+	if avgVol > 0 && m.TotalAmount > 0 {
 		volRatio = m.TotalAmount / avgVol
 		if volRatio > 2.0 {
 			volRatio = 2.0
@@ -336,6 +470,7 @@ func (s *MarketSentinelService) calculateScore(m *model.MarketSentiment, avgVol 
 			volRatio = 0.2
 		}
 	}
+
 	rawScore := 0.45*upRatio + 0.25*limitUpRatio + 0.30*(volRatio/2.0)
 	score := int(math.Round(rawScore * 100))
 	if score > 100 {

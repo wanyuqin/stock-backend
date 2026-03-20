@@ -21,30 +21,27 @@ import (
 //   估值分位   15 分  — PE 分位 < 50% 加分
 // ═══════════════════════════════════════════════════════════════
 
-// ScoreItem 单维度得分明细
 type ScoreItem struct {
 	Name     string `json:"name"`
-	Score    int    `json:"score"`  // 实际得分
-	MaxScore int    `json:"max"`    // 满分
-	Level    string `json:"level"`  // "good" | "normal" | "bad"
-	Desc     string `json:"desc"`   // 一句话说明
+	Score    int    `json:"score"`
+	MaxScore int    `json:"max"`
+	Level    string `json:"level"` // "good" | "normal" | "bad"
+	Desc     string `json:"desc"`
 }
 
-// StockScoreDTO 完整评分结果
 type StockScoreDTO struct {
 	Code         string      `json:"code"`
 	Name         string      `json:"name"`
-	TotalScore   int         `json:"total_score"`   // 0-100
-	Verdict      string      `json:"verdict"`       // "建议建仓" | "谨慎观望" | "不建议"
+	TotalScore   int         `json:"total_score"`
+	Verdict      string      `json:"verdict"`
 	VerdictLevel string      `json:"verdict_level"` // "go" | "caution" | "no"
 	Items        []ScoreItem `json:"items"`
-	Summary      string      `json:"summary"`       // 一句话综合结论
-	// 关键价位（供 K 线图标注）
-	CurrentPrice float64 `json:"current_price"`
-	MA20         float64 `json:"ma20"`
-	Support      float64 `json:"support"`
-	Resistance   float64 `json:"resistance"`
-	ATR          float64 `json:"atr"`
+	Summary      string      `json:"summary"`
+	CurrentPrice float64     `json:"current_price"`
+	MA20         float64     `json:"ma20"`
+	Support      float64     `json:"support"`
+	Resistance   float64     `json:"resistance"`
+	ATR          float64     `json:"atr"`
 }
 
 type StockScoreService struct {
@@ -74,8 +71,13 @@ func NewStockScoreService(
 	}
 }
 
-// Score 计算指定股票的综合建仓评分
+// Score 使用服务默认数据源计算评分（向后兼容）
 func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScoreDTO, error) {
+	return s.ScoreWithSource(ctx, code, "")
+}
+
+// ScoreWithSource 支持指定数据源（source="" 使用服务默认配置）
+func (s *StockScoreService) ScoreWithSource(ctx context.Context, code, source string) (*StockScoreDTO, error) {
 	type klineResult struct {
 		klines []KLine
 		name   string
@@ -99,8 +101,9 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 	marketCh := make(chan marketResult, 1)
 	valCh    := make(chan valResult, 1)
 
+	// K 线与行情均透传 source，确保数据来源一致
 	go func() {
-		resp, err := s.stockSvc.GetKLine(code, 30)
+		resp, err := s.stockSvc.GetKLineBySource(code, 30, source)
 		if err != nil {
 			klineCh <- klineResult{err: err}
 			return
@@ -108,7 +111,7 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 		klineCh <- klineResult{klines: resp.KLines, name: resp.Name}
 	}()
 	go func() {
-		q, err := s.stockSvc.GetRealtimeQuote(code)
+		q, err := s.stockSvc.GetRealtimeQuoteBySource(code, source)
 		quoteCh <- quoteResult{q: q, err: err}
 	}()
 	go func() {
@@ -138,7 +141,6 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 	klines := kr.klines
 	quote  := qr.q
 
-	// ── 计算技术指标 ─────────────────────────────────────────────
 	var (
 		ma20, ma20Slope     float64
 		support, resistance float64
@@ -150,14 +152,12 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 		atr = calcATRFromKLines(klines, 20)
 	}
 
-	// 板块 RS — RelativeStrength.Diff = 个股涨跌幅 - 板块涨跌幅
 	var rsVal float64
 	rs, rsErr := s.guardianSvc.sectorProvider.GetRelativeStrength(ctx, code, quote.ChangeRate)
 	if rsErr == nil && rs != nil {
-		rsVal = rs.Diff // ← 修复：正确字段名为 Diff，不是 RS
+		rsVal = rs.Diff
 	}
 
-	// ── 逐维度打分 ────────────────────────────────────────────────
 	items := make([]ScoreItem, 0, 5)
 	total := 0
 
@@ -271,7 +271,7 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 		items = append(items, item)
 	}
 
-	// 4. 资金动能（20分）：量比
+	// 4. 资金动能（20分）
 	{
 		maxScore := 20
 		item := ScoreItem{Name: "资金动能", MaxScore: maxScore}
@@ -339,11 +339,11 @@ func (s *StockScoreService) Score(ctx context.Context, code string) (*StockScore
 		items = append(items, item)
 	}
 
-	// ── 综合结论 ──────────────────────────────────────────────────
 	verdict, verdictLevel, summary := buildVerdict(total, items)
 
 	s.log.Info("stock score calculated",
 		zap.String("code", code),
+		zap.String("source", source),
 		zap.Int("score", total),
 		zap.String("verdict", verdict),
 	)

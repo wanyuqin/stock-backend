@@ -8,22 +8,29 @@ import (
 )
 
 type StockScoreHandler struct {
-	svc *service.StockScoreService
-	log *zap.Logger
+	svc      *service.StockScoreService
+	stockSvc *service.StockService
+	log      *zap.Logger
 }
 
-func NewStockScoreHandler(svc *service.StockScoreService, log *zap.Logger) *StockScoreHandler {
-	return &StockScoreHandler{svc: svc, log: log}
+func NewStockScoreHandler(svc *service.StockScoreService, stockSvc *service.StockService, log *zap.Logger) *StockScoreHandler {
+	return &StockScoreHandler{svc: svc, stockSvc: stockSvc, log: log}
 }
 
-// GET /api/v1/stocks/:code/score
+// GET /api/v1/stocks/:code/score?source=qq|em
 func (h *StockScoreHandler) GetScore(c *gin.Context) {
 	code := c.Param("code")
 	if code == "" {
 		BadRequest(c, "code 不能为空")
 		return
 	}
-	result, err := h.svc.Score(c.Request.Context(), code)
+
+	source := c.Query("source")
+	if source == "" {
+		source = h.stockSvc.DefaultMarketSource()
+	}
+
+	result, err := h.svc.ScoreWithSource(c.Request.Context(), code, source)
 	if err != nil {
 		h.log.Warn("StockScoreHandler.GetScore failed",
 			zap.String("code", code), zap.Error(err))

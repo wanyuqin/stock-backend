@@ -1,0 +1,45 @@
+// ── 辅助工具 ──────────────────────────────────────────────────────
+
+function fmt(v: number | null | undefined, digits = 2) {
+  if (v == null) return '—'
+  return v.toFixed(digits)
+}
+
+function rrColor(rr: number | null | undefined) {
+  if (rr == null) return 'text-ink-muted'
+  if (rr >= 3) return 'text-accent-green'
+  if (rr >= 2) return 'text-accent-amber'
+  return 'text-accent-red'
+}
+
+// ── 计划有效期倒计时 ──────────────────────────────────────────────
+function ValidUntilBadge({ validUntil, isActive }: { validUntil: string; isActive: boolean }) {
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  const target = new Date(validUntil); target.setHours(0, 0, 0, 0)
+  const diffDays = Math.round((target.getTime() - today.getTime()) / 86400000)
+
+  if (!isActive) return <span className="text-ink-secondary">{validUntil.slice(0, 10)}</span>
+  if (diffDays < 0) return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono bg-accent-red/10 border border-accent-red/30 text-accent-red">
+      已过期 {Math.abs(diffDays)} 天
+    </span>
+  )
+  if (diffDays === 0) return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono bg-accent-red/10 border border-accent-red/30 text-accent-red animate-pulse">
+      今日到期！
+    </span>
+  )
+  if (diffDays <= 3) return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono bg-accent-amber/10 border border-accent-amber/30 text-accent-amber">
+      ⏰ 还剩 {diffDays} 天
+    </span>
+  )
+  if (diffDays <= 7) return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono bg-terminal-muted border border-terminal-border text-ink-secondary">
+      还剩 {diffDays} 天
+    </span>
+  )
+  return <span className="text-ink-secondary">{validUntil.slice(0, 10)}</span>
+}
+
+// ── 创建/编辑弹框 ─────────────────────────────────────────────────

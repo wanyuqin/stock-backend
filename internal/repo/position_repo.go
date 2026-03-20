@@ -3,6 +3,8 @@ package repo
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -128,6 +130,34 @@ func (r *positionRepo) Upsert(ctx context.Context, p *model.PositionDetail) erro
 
 func (r *positionRepo) SaveDiagnostic(ctx context.Context, d *model.PositionDiagnostic) error {
 	return r.db.WithContext(ctx).Create(d).Error
+}
+
+func (r *positionRepo) ListDiagnosticsByCodes(ctx context.Context, codes []string, from time.Time) ([]*model.PositionDiagnostic, error) {
+	if len(codes) == 0 {
+		return []*model.PositionDiagnostic{}, nil
+	}
+	normCodes := make([]string, 0, len(codes))
+	for _, c := range codes {
+		cc := strings.TrimSpace(c)
+		if cc == "" {
+			continue
+		}
+		normCodes = append(normCodes, cc)
+	}
+	if len(normCodes) == 0 {
+		return []*model.PositionDiagnostic{}, nil
+	}
+	rows := make([]*model.PositionDiagnostic, 0, 256)
+	q := r.db.WithContext(ctx).
+		Where("stock_code IN ?", normCodes).
+		Order("stock_code ASC, created_at ASC, id ASC")
+	if !from.IsZero() {
+		q = q.Where("created_at >= ?", from)
+	}
+	if err := q.Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // ─────────────────────────────────────────────────────────────────

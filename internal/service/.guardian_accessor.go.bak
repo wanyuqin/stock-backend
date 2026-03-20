@@ -1,0 +1,8 @@
+package service
+
+import "stock-backend/internal/repo"
+
+// PosRepo 暴露内部 posRepo，供同包外的组合服务使用
+func (s *PositionGuardianService) PosRepo() repo.PositionGuardianRepo {
+	return s.posRepo
+}

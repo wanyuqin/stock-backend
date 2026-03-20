@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"stock-backend/internal/model"
 	"stock-backend/internal/repo"
 	"stock-backend/internal/service"
 )
@@ -32,25 +34,11 @@ func NewStockHandler(
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/stocks
-// 查询参数：
-//   - limit  int (default=50, max=200)
-//   - offset int (default=0)
 // ─────────────────────────────────────────────────────────────────
 
-// List godoc
-//
-//	@Summary     列出所有股票
-//	@Tags        stocks
-//	@Produce     json
-//	@Param       limit   query  int  false  "每页数量(default 50)"
-//	@Param       offset  query  int  false  "偏移量(default 0)"
-//	@Success     200  {object}  Response
-//	@Router      /api/v1/stocks [get]
 func (h *StockHandler) List(c *gin.Context) {
 	limit := queryInt(c, "limit", 50)
 	offset := queryInt(c, "offset", 0)
-
-	// 防止参数越界
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -75,7 +63,9 @@ func (h *StockHandler) List(c *gin.Context) {
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/stocks/:code
-// 查询数据库中的股票基础信息
+//
+// 优先查 stocks 表；查不到则从实时行情接口获取股票名称并自动入库，
+// 避免未提前爬取的合法 A 股代码报"股票不存在"。
 // ─────────────────────────────────────────────────────────────────
 
 func (h *StockHandler) GetByCode(c *gin.Context) {
@@ -85,40 +75,66 @@ func (h *StockHandler) GetByCode(c *gin.Context) {
 		return
 	}
 
-	stock, err := h.stockRepo.GetByCode(c.Request.Context(), code)
-	if err != nil {
-		h.log.Warn("StockHandler.GetByCode not found", zap.String("code", code), zap.Error(err))
+	ctx := c.Request.Context()
+
+	// 1. 先查数据库
+	stock, err := h.stockRepo.GetByCode(ctx, code)
+	if err == nil {
+		OK(c, stock)
+		return
+	}
+
+	// 2. 数据库未入库 → 从行情接口拉取，自动注册
+	h.log.Info("GetByCode: not in db, fetching from market", zap.String("code", code))
+	quote, qErr := h.stockSvc.GetRealtimeQuote(code)
+	if qErr != nil || quote == nil || quote.Name == "" {
+		h.log.Warn("GetByCode: market fetch failed", zap.String("code", code), zap.Error(qErr))
 		NotFound(c, "股票不存在: "+code)
 		return
 	}
 
-	OK(c, stock)
+	// 推断市场（0/3 开头为深交所，其余为上交所）
+	market := model.MarketSH
+	if len(code) == 6 && (code[0] == '0' || code[0] == '3') {
+		market = model.MarketSZ
+	}
+
+	newStock := &model.Stock{
+		Code:   code,
+		Name:   quote.Name,
+		Market: market,
+	}
+
+	// 异步入库，不阻塞响应；用 Background context 避免请求结束后 ctx 被取消
+	go func(s *model.Stock) {
+		if uErr := h.stockRepo.Upsert(context.Background(), s); uErr != nil {
+			h.log.Warn("GetByCode: upsert failed", zap.String("code", s.Code), zap.Error(uErr))
+		}
+	}(newStock)
+
+	OK(c, newStock)
 }
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/v1/stocks/:code/quote
-// 调用 MarketProvider 获取实时行情（带 5s 内存缓存）
 // ─────────────────────────────────────────────────────────────────
 
-// GetQuote godoc
-//
-//	@Summary     获取股票实时行情
-//	@Tags        stocks
-//	@Produce     json
-//	@Param       code  path  string  true  "股票代码，如 600519"
-//	@Success     200  {object}  Response{data=service.Quote}
-//	@Router      /api/v1/stocks/{code}/quote [get]
 func (h *StockHandler) GetQuote(c *gin.Context) {
 	code := c.Param("code")
 	if code == "" {
 		BadRequest(c, "code 不能为空")
 		return
 	}
+	source := c.Query("source")
+	if source == "" {
+		source = h.stockSvc.DefaultMarketSource()
+	}
 
-	quote, err := h.stockSvc.GetRealtimeQuote(code)
+	quote, err := h.stockSvc.GetRealtimeQuoteBySource(code, source)
 	if err != nil {
 		h.log.Error("StockHandler.GetQuote",
 			zap.String("code", code),
+			zap.String("source", source),
 			zap.Error(err),
 		)
 		c.JSON(http.StatusBadGateway, Response{
@@ -136,7 +152,6 @@ func (h *StockHandler) GetQuote(c *gin.Context) {
 // 工具函数
 // ─────────────────────────────────────────────────────────────────
 
-// queryInt 从 query string 读取整数参数，失败时返回 defaultVal。
 func queryInt(c *gin.Context, key string, defaultVal int) int {
 	s := c.Query(key)
 	if s == "" {
