@@ -126,3 +126,23 @@ type BuyPlanRepo interface {
 	Delete(ctx context.Context, id int64) error
 	CountActive(ctx context.Context, userID int64) (int64, error)
 }
+
+// KlineRepo K 线历史数据访问接口。
+type KlineRepo interface {
+	// ── 数据写入 ────────────────────────────────────────────────
+	BulkUpsert(ctx context.Context, bars []*model.StockKlineDaily) error
+	DeleteByCode(ctx context.Context, code string) error
+
+	// ── 数据读取 ────────────────────────────────────────────────
+	GetRange(ctx context.Context, code string, from, to time.Time) ([]*model.StockKlineDaily, error)
+	GetLatestN(ctx context.Context, code string, n int) ([]*model.StockKlineDaily, error)
+	GetEarliestDate(ctx context.Context, code string) (*time.Time, error)
+	GetLatestDate(ctx context.Context, code string) (*time.Time, error)
+	CountByCode(ctx context.Context, code string) (int64, error)
+
+	// ── 同步状态 ────────────────────────────────────────────────
+	UpsertSyncStatus(ctx context.Context, s *model.StockKlineSyncStatus) error
+	GetSyncStatus(ctx context.Context, code string) (*model.StockKlineSyncStatus, error)
+	ListSyncStatus(ctx context.Context) ([]*model.StockKlineSyncStatus, error)
+	DeleteSyncStatus(ctx context.Context, code string) error
+}

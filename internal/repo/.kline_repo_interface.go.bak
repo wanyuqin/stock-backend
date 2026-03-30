@@ -1,0 +1,52 @@
+package repo
+
+import (
+	"context"
+	"time"
+
+	"stock-backend/internal/model"
+)
+
+// KlineRepo K线历史数据访问接口
+type KlineRepo interface {
+	// ── 数据写入 ────────────────────────────────────────────────
+
+	// BulkUpsert 批量写入，ON CONFLICT (code, trade_date) DO NOTHING
+	// 每批最多 500 条，内部自动分批
+	BulkUpsert(ctx context.Context, bars []*model.StockKlineDaily) error
+
+	// DeleteByCode 删除某股票全部历史数据（重新同步时调用）
+	DeleteByCode(ctx context.Context, code string) error
+
+	// ── 数据读取 ────────────────────────────────────────────────
+
+	// GetRange 按时间范围读，结果按 trade_date ASC
+	// from/to 为零值时不限制
+	GetRange(ctx context.Context, code string, from, to time.Time) ([]*model.StockKlineDaily, error)
+
+	// GetLatestN 读最近 N 根（按 trade_date DESC LIMIT n，返回时倒转为 ASC）
+	GetLatestN(ctx context.Context, code string, n int) ([]*model.StockKlineDaily, error)
+
+	// GetEarliestDate 查最早交易日（用于断点续传）
+	GetEarliestDate(ctx context.Context, code string) (*time.Time, error)
+
+	// GetLatestDate 查最新交易日
+	GetLatestDate(ctx context.Context, code string) (*time.Time, error)
+
+	// CountByCode 查某股票已有多少根
+	CountByCode(ctx context.Context, code string) (int64, error)
+
+	// ── 同步状态 ────────────────────────────────────────────────
+
+	// UpsertSyncStatus 写入/更新同步状态
+	UpsertSyncStatus(ctx context.Context, s *model.StockKlineSyncStatus) error
+
+	// GetSyncStatus 查单个股票状态
+	GetSyncStatus(ctx context.Context, code string) (*model.StockKlineSyncStatus, error)
+
+	// ListSyncStatus 查所有已同步股票，按 latest_date DESC
+	ListSyncStatus(ctx context.Context) ([]*model.StockKlineSyncStatus, error)
+
+	// DeleteSyncStatus 删除状态记录（配合 DeleteByCode）
+	DeleteSyncStatus(ctx context.Context, code string) error
+}
