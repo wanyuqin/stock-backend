@@ -1,6 +1,8 @@
 package router
 
 import (
+	"context"
+
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -10,6 +12,7 @@ import (
 	"stock-backend/internal/data"
 	"stock-backend/internal/repo"
 	"stock-backend/internal/service"
+	"stock-backend/internal/smartposition"
 )
 
 func New(cfg *config.Config, log *zap.Logger) (
@@ -36,82 +39,88 @@ func New(cfg *config.Config, log *zap.Logger) (
 	db := data.DB()
 
 	// ── Repo ──────────────────────────────────────────────────────
-	stockRepo           := repo.NewStockRepo(db)
-	watchlistRepo       := repo.NewWatchlistRepo(db)
-	buyPlanRepo         := repo.NewBuyPlanRepo(db)
-	tradeRepo           := repo.NewTradeLogRepo(db)
-	scanRepo            := repo.NewScanRepo(db)
-	mfRepo              := repo.NewMoneyFlowRepo(db)
-	alertRepo           := repo.NewAlertRepo(db)
-	snapshotRepo        := repo.NewSnapshotRepo(db)
-	positionRepo        := repo.NewPositionRepo(db)
-	reviewRepo          := repo.NewReviewRepo(db)
-	behaviorStatsRepo   := repo.NewBehaviorStatsRepo(db)
-	tradeV2Repo         := repo.NewTradeLogV2Repo(db)
+	stockRepo := repo.NewStockRepo(db)
+	watchlistRepo := repo.NewWatchlistRepo(db)
+	buyPlanRepo := repo.NewBuyPlanRepo(db)
+	tradeRepo := repo.NewTradeLogRepo(db)
+	scanRepo := repo.NewScanRepo(db)
+	mfRepo := repo.NewMoneyFlowRepo(db)
+	alertRepo := repo.NewAlertRepo(db)
+	snapshotRepo := repo.NewSnapshotRepo(db)
+	positionRepo := repo.NewPositionRepo(db)
+	reviewRepo := repo.NewReviewRepo(db)
+	behaviorStatsRepo := repo.NewBehaviorStatsRepo(db)
+	tradeV2Repo := repo.NewTradeLogV2Repo(db)
 	marketSentimentRepo := repo.NewMarketSentimentRepo(db)
-	stockReportRepo     := repo.NewStockReportRepo(db)
-	valuationRepo       := repo.NewValuationRepo(db)
-	sectorRepo          := repo.NewSectorRepo(db)
+	stockReportRepo := repo.NewStockReportRepo(db)
+	valuationRepo := repo.NewValuationRepo(db)
+	sectorRepo := repo.NewSectorRepo(db)
 	accountSnapshotRepo := repo.NewAccountSnapshotRepo(db)
 	screenerTemplateRepo := repo.NewScreenerTemplateRepo(db)
-	riskRepo            := repo.NewRiskRepo(db)
-	klineRepo           := repo.NewKlineRepo(db) // ★ K线历史
+	riskRepo := repo.NewRiskRepo(db)
+	klineRepo := repo.NewKlineRepo(db) // ★ K线历史
 
 	// ── Service ───────────────────────────────────────────────────
-	stockSvc            := service.NewStockServiceWithSource(log, cfg.MarketDataSourceDefault)
-	bigDealSvc          := service.NewBigDealService(service.NewQQDadanFetcher(log), log)
-	aiSvc               := service.NewAIAnalysisService(log)
-	buyPlanSvc          := service.NewBuyPlanService(buyPlanRepo, stockSvc, log)
-	tradeSvc            := service.NewTradeService(tradeRepo, positionRepo, stockSvc, log)
-	scanSvc             := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
-	reportSvc           := service.NewReportService(scanRepo, aiSvc, log)
-	mfSvc               := service.NewMoneyFlowService(mfRepo, stockRepo, log)
-	discoverySvc        := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
-	crawlerSvc          := service.NewCrawlerService(snapshotRepo, log)
-	screenerSvc         := service.NewScreenerService(snapshotRepo, log)
-	guardianSvc         := service.NewPositionGuardianService(positionRepo, sectorRepo, stockSvc, aiSvc, log)
-	auditSvc            := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
-	marketSentinelSvc   := service.NewMarketSentinelService(marketSentimentRepo, cfg.MarketDataSourceDefault, log)
-	stockReportSvc      := service.NewStockReportService(stockReportRepo, aiSvc, log)
-	valuationSvc        := service.NewValuationService(valuationRepo, watchlistRepo, cfg.MarketDataSourceDefault, log)
-	scoreSvc            := service.NewStockScoreService(guardianSvc, marketSentinelSvc, valuationRepo, watchlistRepo, stockSvc, log)
-	newsAnalyzer        := service.NewNewsSentimentAnalyzer(aiSvc, buyPlanRepo, positionRepo, log)
-	interactiveSvc      := service.NewInteractivePlatformService(log)
-	morningBriefSvc     := service.NewMorningBriefService(marketSentinelSvc, guardianSvc, stockReportSvc, valuationSvc, stockSvc, buyPlanRepo, watchlistRepo, aiSvc, interactiveSvc, log)
-	equitySvc           := service.NewEquityService(accountSnapshotRepo, tradeSvc, log)
-	sectorHeatmapSvc    := service.NewSectorHeatmapService(log)
+	stockSvc := service.NewStockServiceWithSource(log, cfg.MarketDataSourceDefault)
+	bigDealSvc := service.NewBigDealService(service.NewQQDadanFetcher(log), log)
+	aiSvc := service.NewAIAnalysisService(log)
+	buyPlanSvc := service.NewBuyPlanService(buyPlanRepo, stockSvc, log)
+	tradeSvc := service.NewTradeService(tradeRepo, positionRepo, stockSvc, log)
+	scanSvc := service.NewScanService(scanRepo, watchlistRepo, stockSvc, log)
+	reportSvc := service.NewReportService(scanRepo, aiSvc, log)
+	mfSvc := service.NewMoneyFlowService(mfRepo, stockRepo, log)
+	discoverySvc := service.NewDiscoveryService(mfSvc, watchlistRepo, alertRepo, stockRepo, log)
+	crawlerSvc := service.NewCrawlerService(snapshotRepo, log)
+	screenerSvc := service.NewScreenerService(snapshotRepo, log)
+	guardianSvc := service.NewPositionGuardianService(positionRepo, sectorRepo, stockSvc, aiSvc, log)
+	auditSvc := service.NewAuditService(reviewRepo, tradeV2Repo, stockSvc, aiSvc, log)
+	marketSentinelSvc := service.NewMarketSentinelService(marketSentimentRepo, cfg.MarketDataSourceDefault, log)
+	stockReportSvc := service.NewStockReportService(stockReportRepo, aiSvc, log)
+	valuationSvc := service.NewValuationService(valuationRepo, watchlistRepo, cfg.MarketDataSourceDefault, log)
+	scoreSvc := service.NewStockScoreService(guardianSvc, marketSentinelSvc, valuationRepo, watchlistRepo, stockSvc, log)
+	newsAnalyzer := service.NewNewsSentimentAnalyzer(aiSvc, buyPlanRepo, positionRepo, log)
+	interactiveSvc := service.NewInteractivePlatformService(log)
+	morningBriefSvc := service.NewMorningBriefService(marketSentinelSvc, guardianSvc, stockReportSvc, valuationSvc, stockSvc, buyPlanRepo, watchlistRepo, aiSvc, interactiveSvc, log)
+	equitySvc := service.NewEquityService(accountSnapshotRepo, tradeSvc, log)
+	sectorHeatmapSvc := service.NewSectorHeatmapService(log)
 	screenerTemplateSvc := service.NewScreenerTemplateService(screenerTemplateRepo, screenerSvc, log)
-	riskSvc             := service.NewRiskService(riskRepo, tradeRepo, positionRepo, tradeSvc, guardianSvc, buyPlanRepo, stockRepo, stockReportRepo, log)
-	klineSyncSvc        := service.NewKlineSyncService(klineRepo, stockSvc, log) // ★ K线同步
+	riskSvc := service.NewRiskService(riskRepo, tradeRepo, positionRepo, tradeSvc, guardianSvc, buyPlanRepo, stockRepo, stockReportRepo, log)
+	klineSyncSvc := service.NewKlineSyncService(klineRepo, stockSvc, log) // ★ K线同步
 
 	buyPlanSvc.SetGuardianSvc(guardianSvc)
 
 	// ── Handler ───────────────────────────────────────────────────
-	stockHandler            := handler.NewStockHandler(stockRepo, stockSvc, log)
-	watchlistHandler        := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
-	buyPlanHandler          := handler.NewBuyPlanHandler(buyPlanSvc, log)
-	analysisHandler         := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
-	tradeHandler            := handler.NewTradeHandler(tradeSvc, log)
-	scanHandler             := handler.NewScanHandler(scanSvc, reportSvc, log)
-	reportHandler           := handler.NewReportHandler(reportSvc, log)
-	alertHandler            := handler.NewAlertHandler(discoverySvc, mfSvc, log)
-	screenerHandler         := handler.NewScreenerHandler(screenerSvc, crawlerSvc, log)
-	positionHandler         := handler.NewPositionHandler(guardianSvc, log)
-	reviewHandler           := handler.NewReviewHandler(auditSvc, behaviorStatsRepo, log)
-	marketSentinelHandler   := handler.NewMarketSentinelHandler(marketSentinelSvc, log)
-	stockReportHandler      := handler.NewStockReportHandler(stockReportSvc, log)
-	valuationHandler        := handler.NewValuationHandler(valuationSvc, log)
-	bigDealHandler          := handler.NewBigDealHandler(bigDealSvc, stockSvc, log)
-	scoreHandler            := handler.NewStockScoreHandler(scoreSvc, stockSvc, log)
-	newsSentimentHandler    := handler.NewNewsSentimentHandler(newsAnalyzer, log)
-	morningBriefHandler     := handler.NewMorningBriefHandler(morningBriefSvc, log)
-	equityHandler           := handler.NewEquityHandler(equitySvc, log)
-	sectorHeatmapHandler    := handler.NewSectorHeatmapHandler(sectorHeatmapSvc, log)
+	stockHandler := handler.NewStockHandler(stockRepo, stockSvc, log)
+	watchlistHandler := handler.NewWatchlistHandler(watchlistRepo, stockRepo, stockSvc, log)
+	buyPlanHandler := handler.NewBuyPlanHandler(buyPlanSvc, log)
+	analysisHandler := handler.NewAnalysisHandler(stockSvc, aiSvc, log)
+	tradeHandler := handler.NewTradeHandler(tradeSvc, log)
+	scanHandler := handler.NewScanHandler(scanSvc, reportSvc, log)
+	reportHandler := handler.NewReportHandler(reportSvc, log)
+	alertHandler := handler.NewAlertHandler(discoverySvc, mfSvc, log)
+	screenerHandler := handler.NewScreenerHandler(screenerSvc, crawlerSvc, log)
+	positionHandler := handler.NewPositionHandler(guardianSvc, log)
+	reviewHandler := handler.NewReviewHandler(auditSvc, behaviorStatsRepo, log)
+	marketSentinelHandler := handler.NewMarketSentinelHandler(marketSentinelSvc, log)
+	stockReportHandler := handler.NewStockReportHandler(stockReportSvc, log)
+	valuationHandler := handler.NewValuationHandler(valuationSvc, log)
+	bigDealHandler := handler.NewBigDealHandler(bigDealSvc, stockSvc, log)
+	scoreHandler := handler.NewStockScoreHandler(scoreSvc, stockSvc, log)
+	newsSentimentHandler := handler.NewNewsSentimentHandler(newsAnalyzer, log)
+	morningBriefHandler := handler.NewMorningBriefHandler(morningBriefSvc, log)
+	equityHandler := handler.NewEquityHandler(equitySvc, log)
+	sectorHeatmapHandler := handler.NewSectorHeatmapHandler(sectorHeatmapSvc, log)
 	screenerTemplateHandler := handler.NewScreenerTemplateHandler(screenerTemplateSvc, log)
-	riskHandler             := handler.NewRiskHandler(riskSvc, log)
-	klineSyncHandler        := handler.NewKlineSyncHandler(klineSyncSvc, log) // ★ K线同步
-	healthHandler           := handler.NewHealthHandler()
-	systemHandler           := handler.NewSystemHandler(cfg.MarketDataSourceDefault, log)
+	riskHandler := handler.NewRiskHandler(riskSvc, log)
+	klineSyncHandler := handler.NewKlineSyncHandler(klineSyncSvc, log) // ★ K线同步
+	healthHandler := handler.NewHealthHandler()
+	systemHandler := handler.NewSystemHandler(cfg.MarketDataSourceDefault, log)
+	smartPositionRepos := smartposition.NewRepositories(stockSvc, bigDealSvc, valuationRepo, stockReportRepo, marketSentinelSvc, riskRepo, watchlistRepo, stockRepo, buyPlanSvc)
+	smartPositionSvc, err := smartposition.NewService(context.Background(), smartPositionRepos, log)
+	if err != nil {
+		log.Fatal("failed to init smart position service", zap.Error(err))
+	}
+	smartPositionHandler := handler.NewSmartPositionHandler(smartPositionSvc, log)
 
 	// ── 路由 ──────────────────────────────────────────────────────
 	r.GET("/health", healthHandler.Check)
@@ -134,10 +143,10 @@ func New(cfg *config.Config, log *zap.Logger) (
 			stocks.GET("/:code/buy-plans", buyPlanHandler.ListByCode)
 			stocks.GET("/:code/score", scoreHandler.GetScore)
 			// ★ K线历史同步
-			stocks.POST("/:code/kline/sync",        klineSyncHandler.StartSync)
-			stocks.GET("/:code/kline/sync-status",  klineSyncHandler.GetSyncStatus)
-			stocks.GET("/:code/kline/local",        klineSyncHandler.GetLocalKLine)
-			stocks.DELETE("/:code/kline/sync",      klineSyncHandler.DeleteAndReset)
+			stocks.POST("/:code/kline/sync", klineSyncHandler.StartSync)
+			stocks.GET("/:code/kline/sync-status", klineSyncHandler.GetSyncStatus)
+			stocks.GET("/:code/kline/local", klineSyncHandler.GetLocalKLine)
+			stocks.DELETE("/:code/kline/sync", klineSyncHandler.DeleteAndReset)
 		}
 
 		watchlist := v1.Group("/watchlist")
@@ -260,6 +269,16 @@ func New(cfg *config.Config, log *zap.Logger) (
 			systemGroup.GET("/data-source-status", systemHandler.GetDataSourceStatus)
 		}
 
+		smartPosition := v1.Group("/smart-position")
+		{
+			smartPosition.POST("/analyze", smartPositionHandler.Analyze)
+			smartPosition.POST("/execute", smartPositionHandler.Execute)
+			smartPosition.POST("/tasks", smartPositionHandler.CreateTask)
+			smartPosition.GET("/tasks/:id", smartPositionHandler.GetTask)
+			smartPosition.GET("/tasks/:id/stream", smartPositionHandler.StreamTask)
+			smartPosition.POST("/tasks/:id/execute", smartPositionHandler.ExecuteTask)
+		}
+
 		// ★ K线历史库汇总
 		kline := v1.Group("/kline")
 		{
@@ -272,13 +291,13 @@ func New(cfg *config.Config, log *zap.Logger) (
 			mb.GET("", morningBriefHandler.Get)
 			sec := mb.Group("/sections")
 			{
-				sec.GET("/market",     morningBriefHandler.GetMarket)
-				sec.GET("/position",   morningBriefHandler.GetPosition)
-				sec.GET("/buy-plans",  morningBriefHandler.GetBuyPlans)
-				sec.GET("/reports",    morningBriefHandler.GetReports)
-				sec.GET("/valuation",  morningBriefHandler.GetValuation)
-				sec.GET("/news",       morningBriefHandler.GetNews)
-				sec.GET("/external",   morningBriefHandler.GetExternal)
+				sec.GET("/market", morningBriefHandler.GetMarket)
+				sec.GET("/position", morningBriefHandler.GetPosition)
+				sec.GET("/buy-plans", morningBriefHandler.GetBuyPlans)
+				sec.GET("/reports", morningBriefHandler.GetReports)
+				sec.GET("/valuation", morningBriefHandler.GetValuation)
+				sec.GET("/news", morningBriefHandler.GetNews)
+				sec.GET("/external", morningBriefHandler.GetExternal)
 				sec.GET("/ai-comment", morningBriefHandler.GetAIComment)
 			}
 		}
